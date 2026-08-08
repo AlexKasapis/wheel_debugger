@@ -84,7 +84,7 @@ def decode_ff(raw):
     return [name for bit, name in sorted(FF_EFFECTS.items()) if value >> bit & 1]
 
 
-def check_driver():
+def check_driver(_nodes):
     mods = read_text('/proc/modules') or ''
     loaded = any(line.split(' ')[0] == MODULE for line in mods.splitlines())
     bound = [os.path.basename(p) for p in glob.glob(f'{DRIVER_DIR}/*{VENDOR_MATCH}*')]
@@ -151,7 +151,7 @@ def check_hidraw_target(nodes):
                'hardware')
 
 
-def check_diagnostic_state():
+def check_diagnostic_state(_nodes):
     """Is the box left in the modified HID state?
 
     The live hidraw_pid parameter cannot be read back, so the modprobe.d file is
@@ -171,7 +171,7 @@ def check_diagnostic_state():
                f'{text.strip()[:80]}')
 
 
-def check_udev():
+def check_udev(_nodes):
     if os.path.exists(UDEV_RULE):
         return chk('udev', 'udev rule', 'ok', UDEV_RULE)
     return chk('udev', 'udev rule', 'warn', f'{UDEV_RULE} missing',
@@ -197,7 +197,7 @@ def check_ff(nodes):
                f'{len(effects)} effect types: {", ".join(effects)}')
 
 
-def check_games_group():
+def check_games_group(_nodes):
     """The re-login trap: added to the group, but not in this process's set."""
     try:
         entry = grp.getgrnam('games')
@@ -237,28 +237,24 @@ def check_ffb_writable(nodes):
                're-login, sometimes a missing udev rule')
 
 
+# Every check takes the resolved nodes, whether or not it looks at them, so the
+# runner needs no per-check argument list.
+CHECKS = (check_driver, check_nodes, check_hidraw_target, check_diagnostic_state,
+          check_udev, check_ff, check_games_group, check_ffb_writable)
+
+
 def _collect():
     nodes = hid_layout.find_nodes()
     checks = []
-    for fn, args in (
-        (check_driver, ()),
-        (check_nodes, (nodes,)),
-        (check_hidraw_target, (nodes,)),
-        (check_diagnostic_state, ()),
-        (check_udev, ()),
-        (check_ff, (nodes,)),
-        (check_games_group, ()),
-        (check_ffb_writable, (nodes,)),
-    ):
+    for fn in CHECKS:
         try:
-            checks.append(fn(*args))
+            checks.append(fn(nodes))
         except Exception as exc:                          # never break the page
             checks.append(chk(fn.__name__, fn.__name__, 'unknown',
                               f'check raised {exc!r}'))
 
     by_id = {c['id']: c for c in checks}
-    worst = max((RANK[c['status']] for c in checks), default=0)
-    overall = next(k for k, v in RANK.items() if v == worst)
+    overall = max(checks, key=lambda c: RANK[c['status']])['status']
 
     bad = [c['label'] for c in checks if c['status'] == 'bad']
     if bad:

@@ -64,10 +64,13 @@ sweep.
 ## Repository layout
 
 ```
-pedal-web.py        the dashboard - start here, this is the whole tool
+pedal-web.py        the process - device thread + HTTP server. start here
+tracker.py          the latched state: ingest() a report, snapshot() the page
+decode.py           pure report decoders - no state, no I/O
 hid_layout.py       report-descriptor parser + device-node resolution
 sysstate.py         the system checks (detection only, never execution)
 ffb.py              the force-feedback test and its measurement
+web/                the page itself - index.html, app.css, app.js
 setup/              root install and HID configuration
 tools/              selftest-decode.py - offline test for all of the above
 data/               labelled pedal captures - evidence, and the test's fixtures
@@ -79,10 +82,15 @@ Everything diagnostic lives in the web app. What is left outside it is either a
 library it imports, a root installer it can only tell you to run, or the test that
 lets it be changed without the hardware present.
 
-`tools/selftest-decode.py` replays the archived capture in `data/` through the
-decoders and asserts the whole report map, the latching behaviour, the system
-checks and the FFB state machine. It runs with the base powered off and cannot
-move the wheel — run it after touching any offset logic.
+Reports reach the dashboard exactly one way — `Tracker.ingest()`. The reader
+thread does device I/O and nothing else, so every latch, fault and decode is
+reachable without a base attached.
+
+`tools/selftest-decode.py` replays the archived capture in `data/` through
+`Tracker.ingest()` — the same call the reader thread makes — and asserts the
+whole report map, the latching behaviour, the system checks and the FFB state
+machine. 99 checks. It runs with the base powered off and cannot move the wheel;
+run it after touching any offset logic.
 
 You do not need to remember the `setup/` scripts; the dashboard checks whether
 each is needed and hands you the command with the path filled in.
