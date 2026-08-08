@@ -73,6 +73,7 @@ ffb.py              the force-feedback test and its measurement
 web/                the page itself - index.html, app.css, app.js
 setup/              root install and HID configuration
 tools/              selftest-decode.py - offline test for all of the above
+                    bracket-capture.py - scripted capture, at the rig
 data/               labelled pedal captures - evidence, and the test's fixtures
                     (raw-pedal-map.log is raw HID, pedal-map.log is evdev)
 docs/               hardware, report map, driver notes, diagnostic record
@@ -91,6 +92,12 @@ reachable without a base attached.
 whole report map, the latching behaviour, the system checks and the FFB state
 machine. 99 checks. It runs with the base powered off and cannot move the wheel;
 run it after touching any offset logic.
+
+`tools/bracket-capture.py` is the same pipeline pointed at a scripted sequence:
+it prompts through timed phases, brackets every pedal phase with a steering one
+so a null result has a positive control beside it, and prints the raw HID view
+next to the evdev view of the same window. When those two disagree, the fault is
+between the driver and the game rather than in the base.
 
 You do not need to remember the `setup/` scripts; the dashboard checks whether
 each is needed and hands you the command with the path filled in.

@@ -13,6 +13,7 @@ Standard library only, no venv, no build step, no test framework.
 ```sh
 python3 pedal-web.py --no-ffb      # the dashboard on :8765 — use this form
 python3 tools/selftest-decode.py   # 99 assertions, base can be powered off
+python3 tools/bracket-capture.py   # scripted capture, needs someone at the rig
 python3 sysstate.py                # machine state as JSON
 python3 hid_layout.py [node]       # parsed report layout as JSON
 ```
@@ -44,6 +45,16 @@ Two properties worth knowing before trusting a green run:
 Its fixtures are parsed out of `data/raw-pedal-map.log` at runtime, deliberately:
 the archived capture *is* the fixture, so log and test cannot drift apart. Don't
 paste hex into the test.
+
+### The bracketed capture
+
+`tools/bracket-capture.py` is the at-the-rig counterpart: timed phases with
+prompts, every pedal phase bracketed by a steering one. It feeds
+`Tracker.ingest()` like everything else, and samples evdev in the same window
+because that is the path games read — a channel that moves in the raw report but
+not in evdev is a driver problem, not a base problem. Its `HID_TO_ABS` table is
+`hid-input`'s mapping, confirmed against this base: `Slider` lands on
+`ABS_THROTTLE` and `Dial` on `ABS_RUDDER`, so neither evdev name means a pedal.
 
 ## Architecture
 
