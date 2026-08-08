@@ -70,6 +70,23 @@ This supersedes the earlier "intermittent connection" reading. Reseating fixed i
 once and no longer does, and the failure is now a steady pin rather than a
 dropout.
 
+### The swap that located it
+
+Brake and throttle pedals traded jacks. throttle-IN is known good, and the
+throttle pedal's rest chatter is unmistakable wherever it lands:
+
+    throttle pedal in brake-IN    64505 .. 64891, sd 48   its own chatter, intact
+    brake pedal in throttle-IN    65535, later 32023      no response to a hard press
+    brake-IN with nothing in it   65535                   the unplug leg above
+
+**brake-IN carries a real signal** — another pedal's noise came through it whole
+— so the jack, its solder and the base's input are all cleared. The brake pedal
+answered in *neither* jack. The fault is the pedal or its cable.
+
+Its idle value differs by jack: 0 in brake-IN, 65535 in throttle-IN. A pedal
+shorting its own signal line would read 0 in both, so that is unexplained and is
+what a meter at the pedal's plug should settle.
+
 `brF` cannot cause this. It scales force to output; no setting makes an untouched
 pedal report past full press. The tuning menu is not on the path to this fault.
 
@@ -84,7 +101,9 @@ Both explanations remain open, and they produce the same signature:
 
 1. **Worn / oxidised pot wiper.** A connector swap put the throttle pedal in the
    known-good clutch-IN channel and it still produced garbage, so the fault
-   follows the pedal. The **range coverage strip** under the THROTTLE graph is
+   follows the pedal. The brake swap said it again from the other side: the rest
+   chatter left byte 18 with the pedal and reappeared on byte 20, sd 48 in a
+   window where byte 18 sat perfectly flat. The **range coverage strip** under the THROTTLE graph is
    the direct test: sweep the pedal slowly end to end and a healthy pot fills
    every bucket, while a dead spot on the track leaves a gap at the same place
    every sweep. Coverage is latched, so the sweep does not have to be one motion.
@@ -116,13 +135,12 @@ samples) through the throttle-IN channel.
 
 Each needs a positive control in the same window.
 
-1. **Which side of the brake jack holds the signal at 0?** The channel itself is
-   proven alive (above), so the fault is the pedal, its cable, or the jack's
-   contacts. **Swap the brake and throttle pedals between their jacks** —
-   throttle-IN is known good, and the throttle pedal's noise is unmistakable
-   wherever it lands. Brake pedal still pinned at 0 on byte 18 = the pedal or its
-   cable; throttle pedal misbehaving its usual way on byte 20 = the brake-IN jack
-   is fine. One swap answers both directions.
+1. **What inside the brake pedal is dead?** The swap put the fault on the pedal
+   side of the plug: brake-IN carries another pedal's signal intact, and the
+   brake pedal answers in no jack. It is a load cell, so the suspects are the
+   cell, its amplifier and the cable. Measure at the pedal's own plug — is the
+   3.3 V sensor supply reaching it, and does the signal pin move under force? An
+   unpowered amplifier sits at 0 V, which is what brake-IN sees.
 2. **What does an unplugged *pot* channel read?** An old note claims THROTTLE
    reads 0 unplugged while BRAKE reads 65535 — an asymmetry nothing in `data/`
    shows, and it decides how much a resting 65535 is worth. Unplug the clutch and
@@ -162,6 +180,8 @@ Each needs a positive control in the same window.
 2. Clutch input channel on the controller board: check its connector solder
    joints, and whether the sensor supply is present on that header while powered
    (compare against the working throttle header).
+3. Brake pedal: the load cell, its amplifier, or the cable back to its plug. The
+   brake-IN jack and the base's input behind it are cleared — see Brake above.
 
 ## Gotchas that cost real time
 
