@@ -1,0 +1,49 @@
+device: /dev/input/event6
+
+Fanatec pedal mapping + health check
+Keep hands OFF the wheel during pedal phases.
+
+
+==============================================================
+PHASE 0 - BASELINE
+==============================================================
+  axis            min      max     span      n   revs   span%
+  Z             18917    18950       33      2      0    0.1%
+
+==============================================================
+PHASE 1 - THROTTLE
+==============================================================
+  axis            min      max     span      n   revs   span%
+  Z             18900    18966       66     19     16    0.1%
+
+==============================================================
+PHASE 2 - THROTTLE HELD
+==============================================================
+  axis            min      max     span      n   revs   span%
+  Z             18917    18950       33      7      5    0.1%
+
+==============================================================
+PHASE 3 - BRAKE
+==============================================================
+  axis            min      max     span      n   revs   span%
+  Z             18867    18983      116     23     13    0.2%
+  RZ                0    65535    65535    416      5  100.0%
+
+==============================================================
+PHASE 4 - CLUTCH
+==============================================================
+  axis            min      max     span      n   revs   span%
+  Z                 0    18883    18883    464      7   28.8%
+
+==============================================================
+SUMMARY - pedal to axis mapping
+==============================================================
+  throttle  -> NO AXIS RESPONDED
+  brake     -> RZ        span  65535 (100.0% of range)
+  clutch    -> Z         span  18883 (28.8% of range)
+
+  THROTTLE STEADY-HOLD (twitch check):
+    Z          span     33  stdev     11.5  reversals     5  samples 7
+    (a healthy held pedal should be near-flat; large span/reversals = twitch)
+
+log written to /tmp/claude-1000/-home-alex/0244953b-932d-4027-95ec-08cb1c49be8d/scratchpad/pedal-map.log

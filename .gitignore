@@ -1,0 +1,12 @@
+# captured at runtime
+logs/
+
+# upstream driver source, cloned by setup/install-ffb.sh - not our code
+vendor/
+
+__pycache__/
+*.py[cod]
+*.ko
+*.o
+*.mod
+*.mod.c
