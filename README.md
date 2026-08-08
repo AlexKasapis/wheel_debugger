@@ -80,9 +80,11 @@ decode.py           pure report decoders - no state, no I/O
 hid_layout.py       report-descriptor parser + device-node resolution
 sysstate.py         the system checks (detection only, never execution)
 ffb.py              the force-feedback test and its measurement
+evdev_axes.py       HID->ABS mapping and evdev reads, shared by the captures
 web/                the page itself - index.html, app.css, app.js
 setup/              root install and HID configuration
 tools/              selftest-decode.py - offline test for all of the above
+                    live-check.py - watch every channel, no prompts
                     bracket-capture.py - scripted capture, at the rig
 data/               labelled pedal captures - evidence, and the test's fixtures
                     (raw-pedal-map.log is raw HID, pedal-map.log is evdev)
@@ -103,10 +105,15 @@ whole report map, the latching behaviour, the system checks and the FFB state
 machine. 117 checks. It runs with the base powered off and cannot move the wheel;
 run it after touching any offset logic.
 
+`tools/live-check.py` is that pipeline in a terminal, for when the page is not
+where your eyes are. It prints where every channel is resting, names each one as
+it first moves, and ends on a latched summary — no phases and nothing to keep up
+with, because latching makes the order you press things in irrelevant.
+
 `tools/bracket-capture.py` is the same pipeline pointed at a scripted sequence:
-it prompts through timed phases, brackets every pedal phase with a steering one
-so a null result has a positive control beside it, and prints the raw HID view
-next to the evdev view of the same window. When those two disagree, the fault is
+it prompts through timed phases and brackets every pedal phase with a steering
+one, for the times the sequence itself matters. Both print the raw HID view next
+to the evdev view of the same window; when those two disagree, the fault is
 between the driver and the game rather than in the base.
 
 You do not need to remember the `setup/` scripts; the dashboard checks whether

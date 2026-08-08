@@ -13,6 +13,7 @@ Standard library only, no venv, no build step, no test framework.
 ```sh
 python3 pedal-web.py --no-ffb      # the dashboard on :8765 — use this form
 python3 tools/selftest-decode.py   # 117 assertions, base can be powered off
+python3 tools/live-check.py [s]    # watch every channel, no prompts, at the rig
 python3 tools/bracket-capture.py   # scripted capture, needs someone at the rig
 python3 sysstate.py                # machine state as JSON
 python3 hid_layout.py [node]       # parsed report layout as JSON
@@ -46,14 +47,25 @@ Its fixtures are parsed out of `data/raw-pedal-map.log` at runtime, deliberately
 the archived capture *is* the fixture, so log and test cannot drift apart. Don't
 paste hex into the test.
 
-### The bracketed capture
+### The at-the-rig captures
 
-`tools/bracket-capture.py` is the at-the-rig counterpart: timed phases with
-prompts, every pedal phase bracketed by a steering one. It feeds
-`Tracker.ingest()` like everything else, and samples evdev in the same window
-because that is the path games read — a channel that moves in the raw report but
-not in evdev is a driver problem, not a base problem. Its `HID_TO_ABS` table is
-`hid-input`'s mapping, confirmed against this base: `Slider` lands on
+Two tools, both feeding `Tracker.ingest()` like everything else and both sampling
+evdev in the same window — that is the path games read, so a channel that moves
+in the raw report but not in evdev is a driver problem, not a base problem.
+
+- `tools/live-check.py` is the one to reach for. No phases and no prompts: it
+  prints where everything is resting, names each channel as it first moves, and
+  ends on a latched summary. Because `Tracker` latches, the order things are
+  pressed in carries no information, and the positive control is inherent rather
+  than scripted — every channel is on screen, so a wheel that reports proves the
+  stream was alive at the moment a pedal did not.
+- `tools/bracket-capture.py` is the scripted protocol: timed phases with prompts,
+  every pedal phase bracketed by a steering one. Slower, and tedious to repeat.
+  Use it when the *sequence* has to be exact — an unplug/replug leg that has to
+  sit between two known-good windows is the case it was built for.
+
+`evdev_axes.py` holds the HID→ABS mapping for both, so it exists once. That table
+is empirical and not derivable from the descriptor: `Slider` lands on
 `ABS_THROTTLE` and `Dial` on `ABS_RUDDER`, so neither evdev name means a pedal.
 
 ## Architecture
@@ -68,6 +80,7 @@ pedal-web.py   reader thread + HTTP. Owns TRACKER and FFB. No decoding.
   sysstate.py     the machine checks
   ffb.py          FfbTest: the bounded force-feedback run
 web/           index.html + app.css + app.js, served from a fixed table
+evdev_axes.py  HID→ABS mapping + evdev reads. Used by tools/, not by the page.
 ```
 
 - **`tracker.py`** — `Tracker.ingest(report, now)` is the *only* way a report

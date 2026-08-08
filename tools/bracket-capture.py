@@ -15,12 +15,12 @@ Run:  python3 tools/bracket-capture.py
 """
 import os
 import select
-import struct
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import evdev_axes
 import hid_layout
 import tracker
 
@@ -38,30 +38,7 @@ PHASES = [
     ('CLUTCH    - press the clutch pedal, several times',    6),
 ]
 
-# hid-input's own mapping, confirmed against this base: HID Slider lands on
-# ABS_THROTTLE and Dial on ABS_RUDDER, which is why neither is named for a pedal.
-HID_TO_ABS = {'X': 0, 'Y': 1, 'Z': 2, 'Rx': 3, 'Ry': 4, 'Rz': 5,
-              'Slider': 6, 'Dial': 7}
-ABS_NAMES = {0: 'ABS_X', 1: 'ABS_Y', 2: 'ABS_Z', 3: 'ABS_RX', 4: 'ABS_RY',
-             5: 'ABS_RZ', 6: 'ABS_THROTTLE', 7: 'ABS_RUDDER'}
-
-EV_ABS = 0x03
-EVENT_FMT = 'llHHi'                 # input_event: timeval, type, code, value
-EVENT_SZ = struct.calcsize(EVENT_FMT)
-ABSINFO_SZ = 24                     # struct input_absinfo: 6 x s32
 READ_SIZE = 128
-
-
-def abs_now(fd, code):
-    """One axis's current evdev value via EVIOCGABS, or None if unsupported."""
-    import fcntl
-    buf = bytearray(ABSINFO_SZ)
-    req = (2 << 30) | (ABSINFO_SZ << 16) | (ord('E') << 8) | (0x40 + code)
-    try:
-        fcntl.ioctl(fd, req, buf)
-    except OSError:
-        return None
-    return struct.unpack('6i', buf)[0]
 
 
 def drain_hid(fd, track, now):
@@ -76,25 +53,6 @@ def drain_hid(fd, track, now):
         if not data:
             return True
         track.ingest(data, now)
-
-
-def drain_evdev(fd, seen):
-    """Fold queued EV_ABS events into {code: [min, max]}."""
-    while True:
-        try:
-            buf = os.read(fd, EVENT_SZ * 64)
-        except BlockingIOError:
-            return
-        except OSError:
-            return
-        if not buf:
-            return
-        for off in range(0, len(buf) - EVENT_SZ + 1, EVENT_SZ):
-            _, _, typ, code, val = struct.unpack_from(EVENT_FMT, buf, off)
-            if typ != EV_ABS:
-                continue
-            lo, hi = seen.get(code, (val, val))
-            seen[code] = (min(lo, val), max(hi, val))
 
 
 def run_phase(fh, fe, track, secs):
@@ -114,7 +72,7 @@ def run_phase(fh, fe, track, secs):
         if fh in ready and not drain_hid(fh, track, now):
             break
         if fe in ready:
-            drain_evdev(fe, abs_seen)
+            evdev_axes.drain(fe, abs_seen)
     return track.snapshot(), abs_seen
 
 
@@ -136,15 +94,15 @@ def report_phase(snap, abs_seen, fe, abs_map):
         code = abs_map.get(ch['hid'])
         ev = abs_seen.get(code)
         if ev is None and code is not None:
-            cur = abs_now(fe, code)
+            cur = evdev_axes.current(fe, code)
             evtxt = f'{cur} (no events)' if cur is not None else '-'
         else:
             evtxt = f'{ev[0]} .. {ev[1]}' + ('  MOVED' if ev[0] != ev[1] else '')
         flag = '  <== MOVED' if not ch['idle'] else ''
         rng = (f"{ch['min']} .. {ch['max']}" if ch['min'] is not None else '-')
         print(f"    {ch['name']:9s} byte {ch['byte']:2d}  raw {rng:>17s}"
-              f"  span {ch['span_pct']:5.1f}%   {ABS_NAMES.get(code, '?'):13s}"
-              f" {evtxt}{flag}")
+              f"  span {ch['span_pct']:5.1f}%   "
+              f"{evdev_axes.ABS_NAMES.get(code, '?'):13s} {evtxt}{flag}")
 
     if snap['motion']:
         top = ', '.join(f"{m['name']} {m['pct']}%" for m in snap['motion'])
@@ -165,8 +123,7 @@ def main():
     print(f"hidraw {node['path']}   evdev {event}   "
           f"{layout['size']}-byte report from {layout['source']}\n")
 
-    abs_map = {ax['hid']: HID_TO_ABS[ax['hid']]
-               for ax in layout['axes'] if ax['hid'] in HID_TO_ABS}
+    abs_map = evdev_axes.axis_codes(layout)
     track = tracker.Tracker(layout)
 
     fh = os.open(node['path'], os.O_RDONLY | os.O_NONBLOCK)
