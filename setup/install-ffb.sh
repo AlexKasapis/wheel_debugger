@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Install hid-fanatec (FFB driver for Fanatec CSL Elite Wheel Base) via DKMS.
-# Run as root:  sudo bash install-ffb.sh
+# Run with sudo (NOT from a bare root shell - the desktop username is taken
+# from SUDO_USER so it can be added to the 'games' group):
+#     sudo bash setup/install-ffb.sh
+# From a root shell, pass it explicitly:
+#     REAL_USER=alex bash setup/install-ffb.sh
 set -euo pipefail
 
 VERSION="0.2.3"
 DEST="/usr/src/hid-fanatec-${VERSION}"
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+# Must resolve to the desktop user, not root - this account gets added to the
+# 'games' group for sysfs tuning access. Run via `sudo`, not from a root shell.
+REAL_USER="${REAL_USER:-${SUDO_USER:-$(logname 2>/dev/null || true)}}"
 
 # Upstream driver source. Vendored under the repo so this is self-contained;
 # cloned on first run (vendor/ is gitignored - it is not our code).
@@ -14,6 +20,13 @@ SRC_REPO="${SRC_REPO:-${PROJECT_ROOT}/vendor/hid-fanatecff}"
 UPSTREAM="https://github.com/gotzl/hid-fanatecff.git"
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
+
+if [ -z "${REAL_USER}" ] || [ "${REAL_USER}" = "root" ]; then
+    echo "!! could not determine the desktop user (got '${REAL_USER}')." >&2
+    echo "   Run this with sudo, or set it explicitly:" >&2
+    echo "     REAL_USER=alex bash setup/install-ffb.sh" >&2
+    exit 1
+fi
 
 echo "==> 0/6  Ensuring driver source at ${SRC_REPO}"
 if [ ! -d "${SRC_REPO}" ]; then

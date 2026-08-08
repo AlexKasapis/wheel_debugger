@@ -103,8 +103,10 @@ bash setup/verify-ffb.sh
 python3 tools/ffb-test.py
 ```
 
-`install-ffb.sh` adds the user to the `games` group for sysfs tuning access —
-**that needs a re-login to take effect.**
+`install-ffb.sh` adds the invoking user to the `games` group for sysfs tuning
+access — **that needs a re-login to take effect.** Run it with `sudo` rather
+than from a root shell, so it can identify the desktop user; from a root shell
+pass `REAL_USER=<name>` explicitly.
 
 ## Gotchas that cost real time
 
@@ -122,6 +124,10 @@ python3 tools/ffb-test.py
   that pattern — it kills the shell.
 
 ## Current state
+
+> **This machine is currently left in the diagnostic HID state** —
+> `hidraw_pid=0` is active via `/etc/modprobe.d/hid-fanatec.conf` and
+> `setup/revert-rawhid.sh` has not been run. Revert it when pedal work is done.
 
 Force feedback is done. Pedal diagnosis is open; the leading theory is aged
 solder joints or contacts on the pedal jacks — one intermittent (throttle), one

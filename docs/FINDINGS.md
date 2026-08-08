@@ -1,5 +1,17 @@
 # Fanatec CSL Elite — session notes
 
+## CURRENT MACHINE STATE (as of 2026-08-08)
+The box is left in the **modified HID state for diagnostics**:
+- `/etc/modprobe.d/hid-fanatec.conf` exists and contains `hidraw_pid=0`,
+  so HIDRAW points at the REAL base rather than the driver's virtual PID
+  device. `setup/revert-rawhid.sh` has NOT been run. Revert it when pedal
+  diagnostics are finished.
+- `games` group membership was granted by the installer but the **re-login
+  has not happened**, so the `rumble`/`display` sysfs writes are still denied.
+- As of the last check the base was enumerated (`0eb7:0e03`, device `.0109`)
+  and the driver was bound, but it was sending **zero HID reports** — it had
+  been streaming at ~9/s earlier the same day. Suspect base power / standby.
+
 ## Hardware
 - Wheel base: Endor AG FANATEC CSL Elite Wheel Base, USB `0eb7:0e03`
 - Nodes: `/dev/input/event6`, `/dev/input/js1`, `hidraw8`
