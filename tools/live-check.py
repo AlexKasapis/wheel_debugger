@@ -26,9 +26,16 @@ import tracker
 READ_SIZE = 128
 TICK = 0.25          # how often to look for something worth announcing
 
+# Tracker's MOTION_MIN is tuned for a 2 s window, where 200 LSB really is more
+# than dither. Latched over a whole session it is far too low: this base's
+# resting chatter chews through it in seconds and every run would open with a
+# channel announcing itself as moved. A pedal press is worth whole percents -
+# even the faulty throttle manages 2.8% - so the two do not overlap.
+TRAVEL_PCT = 1.0
+
 
 def motion_min(ch):
-    """Peak-to-peak below this is dither, not travel."""
+    """Peak-to-peak below this is not even dither worth mentioning."""
     return tracker.MOTION_MIN16 if ch['bits'] == 16 else tracker.MOTION_MIN8
 
 
@@ -38,12 +45,38 @@ def verdict(ch, ev):
         return 'no data'
     if ch['span'] == 0:
         return 'NEVER MOVED'
-    if ch['span'] < motion_min(ch):
-        return 'dither only'
+    if ch['span_pct'] < TRAVEL_PCT:
+        return 'noise only'
     # Raw travel that never reached evdev is a driver fault, not a base fault.
     if ev is None or ev[0] == ev[1]:
         return 'MOVED - RAW ONLY'
     return 'MOVED'
+
+
+PEDALS = ('STEER', 'THROTTLE', 'BRAKE', 'CLUTCH')
+LINE = 78
+
+# The status line redraws itself with \r, which only overwrites on a terminal.
+# Piped to a file it would stack up one row per tick and bury the findings.
+TTY = sys.stdout.isatty()
+
+
+def say(text):
+    """Print above the status line, clearing whatever it left on the row."""
+    print(('\r' + text.ljust(LINE)) if TTY else text)
+
+
+def status_line(fe, codes, layout, elapsed, snap):
+    """Redrawn in place, so a run where nothing moves still looks alive.
+
+    Read through EVIOCGABS rather than the report stream: this base sends
+    nothing at rest, so the stream has no value to show during the silence that
+    makes people think the tool has hung.
+    """
+    vals = '  '.join(f"{ax['name'][:3]} {evdev_axes.current(fe, codes[ax['hid']])}"
+                     for ax in layout['axes'] if ax['name'] in PEDALS)
+    quiet = f"   base silent {snap['silent_for']}s" if snap['silent_for'] else ''
+    return f'  watching {elapsed:5.1f}s   {vals}{quiet}'
 
 
 def volt_range(ch):
@@ -115,13 +148,14 @@ def main():
     fh = os.open(node['path'], os.O_RDONLY | os.O_NONBLOCK)
     fe = os.open(event, os.O_RDONLY | os.O_NONBLOCK)
     abs_seen = {}
-    announced = set()
+    moved, noisy = set(), set()      # announced once each, at most one line per tier
     start = time.time()
 
     try:
         show_rest(fe, layout, codes)
-        print('\nPress anything, in any order. Ctrl-C when done.'
-              if secs is None else f'\nWatching for {secs:.0f}s. Press anything.')
+        print('\nPress anything, in any order — there is no prompt coming.'
+              + ('  Ctrl-C when done.' if secs is None
+                 else f'  Stopping after {secs:.0f}s.'))
 
         next_tick = start + TICK
         while secs is None or time.time() - start < secs:
@@ -143,20 +177,30 @@ def main():
 
             if now >= next_tick:
                 next_tick = now + TICK
-                for ch in track.snapshot()['axes']:
-                    if ch['name'] in announced or ch['min'] is None:
+                snap = track.snapshot()
+                for ch in snap['axes']:
+                    if ch['min'] is None or ch['span'] < motion_min(ch):
                         continue
-                    if ch['span'] >= motion_min(ch):
-                        announced.add(ch['name'])
-                        print(f"  +{now - start:5.1f}s  {ch['name']:9s} moved  "
-                              f"{ch['min']} .. {ch['max']}  "
-                              f"({ch['span_pct']}% of range)")
+                    name, at = ch['name'], f"  +{now - start:5.1f}s"
+                    span = f"{ch['min']} .. {ch['max']}  ({ch['span_pct']}%)"
+                    if ch['span_pct'] >= TRAVEL_PCT and name not in moved:
+                        moved.add(name)
+                        noisy.add(name)
+                        say(f'{at}  {name:9s} TRAVEL  {span}')
+                    elif ch['span_pct'] < TRAVEL_PCT and name not in noisy:
+                        noisy.add(name)
+                        say(f'{at}  {name:9s} noise   {span}  not a press')
+                if TTY:
+                    print(status_line(fe, codes, layout, now - start, snap),
+                          end='', flush=True)
     except KeyboardInterrupt:
         pass
     finally:
         snap = track.snapshot()
         os.close(fh)
         os.close(fe)
+    if TTY:
+        print('\r'.ljust(LINE))
     summarise(snap, abs_seen, codes)
 
 
