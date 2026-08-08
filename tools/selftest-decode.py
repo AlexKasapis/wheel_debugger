@@ -320,49 +320,34 @@ def main():
     ck('an empty bitmask means no force feedback', sysstate.decode_ff('0'), [])
 
     print('\n[9] force-feedback control (ffb.py - no device is touched)')
-    fst = ffb.status()
+    # Every instance here is handed a node lookup that resolves to nothing real,
+    # so start() cannot reach a device however far it gets.
+    test = ffb.FfbTest(find_node=lambda: None)
+    fst = test.status()
     ck('starts idle', fst['phase'], 'idle')
     ck('nothing running', fst['running'], False)
     ck('magnitude stays gentle', fst['magnitude_pct'] <= 30, True)
     ck('each push is bounded in time', fst['duration_ms'] <= 2000, True)
     ck('the effect carries its own stop', ffb.DURATION_MS > 0, True)
-    ck('aborting with nothing running is a no-op', ffb.abort()[0], False)
+    ck('aborting with nothing running is a no-op', test.abort()[0], False)
     ck('status is JSON-serialisable', bool(json.dumps(fst)), True)
 
     # Single flight, checked before the device is looked at.
-    with ffb._LOCK:
-        ffb._STATE['running'] = True
-    try:
-        ok, msg = ffb.start()
-    finally:
-        with ffb._LOCK:
-            ffb._STATE['running'] = False
+    busy = ffb.FfbTest(find_node=lambda: None)
+    busy.running = True
+    ok, msg = busy.start()
     ck('refuses to start a second test', ok, False)
     ck('and says one is already running', 'already running' in msg, True)
 
-    class _NoDevice:
-        @staticmethod
-        def node_path(_kind):
-            return None
+    ok, msg = test.start()
+    ck('refuses to start with no event node', ok, False)
+    ck('and says so', 'no Fanatec event node' in msg, True)
 
-    class _Unwritable:
-        @staticmethod
-        def node_path(_kind):
-            return '/nonexistent/fanatec-event-node'
-
-    real = ffb.hid_layout
-    try:
-        ffb.hid_layout = _NoDevice
-        ok, msg = ffb.start()
-        ck('refuses to start with no event node', ok, False)
-        ck('and says so', 'no Fanatec event node' in msg, True)
-        ffb.hid_layout = _Unwritable
-        ok, msg = ffb.start()
-        ck('refuses to start when the node is not writable', ok, False)
-        ck('and names the permission problem', 'not writable' in msg, True)
-    finally:
-        ffb.hid_layout = real
-    ck('a refused start leaves it idle', ffb.status()['running'], False)
+    unwritable = ffb.FfbTest(find_node=lambda: '/nonexistent/fanatec-event-node')
+    ok, msg = unwritable.start()
+    ck('refuses to start when the node is not writable', ok, False)
+    ck('and names the permission problem', 'not writable' in msg, True)
+    ck('a refused start leaves it idle', test.status()['running'], False)
 
     print()
     if FAILS:

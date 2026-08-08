@@ -28,6 +28,7 @@ FFB_ENABLED = True   # overridden by --no-ffb in __main__
 READ_SIZE = 128      # one report is 33 bytes; this batches without truncating
 
 TRACKER = tracker.Tracker()
+FFB = ffb.FfbTest()
 
 
 # -- the device thread -------------------------------------------------------
@@ -109,7 +110,7 @@ def page_data():
     reader, and the state machine stays ignorant of the actuator.
     """
     data = TRACKER.snapshot()
-    data['ffb'] = ffb.status()
+    data['ffb'] = FFB.status()
     data['ffb_enabled'] = FFB_ENABLED
     return data
 
@@ -157,10 +158,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not FFB_ENABLED:
                 self._json({'ok': False, 'msg': 'FFB disabled (--no-ffb)'}, 403)
                 return
-            ok, msg = ffb.start()
+            ok, msg = FFB.start()
             self._json({'ok': ok, 'msg': msg}, 200 if ok else 409)
         elif self.path == '/ffb/abort':
-            ok, msg = ffb.abort()
+            ok, msg = FFB.abort()
             self._json({'ok': ok, 'msg': msg})
         else:
             self.send_error(404)
