@@ -67,6 +67,42 @@ rather than from guessed byte offsets:
   with the field the descriptor says lives there, plus a warning if a byte moves
   that nothing claims
 
+### System checks
+
+A strip under the banner that answers "is this machine even in a state where the
+page can be believed?" — driver bound, whether hidraw points at the **real base
+or the driver's virtual PID device**, whether the box is still in diagnostic HID
+mode, the udev rule, what force feedback the device advertises, and whether the
+`games` group membership has actually taken effect yet. It is one green line when
+everything is fine and opens itself when something is not.
+
+A failing check names the exact command that fixes it. It never runs it: root
+work stays with you. The commands are absolute paths and selectable with one tap,
+because `navigator.clipboard` does nothing over plain http on the LAN — i.e. on
+the phone that is actually next to the rig.
+
+This is the check that matters most:
+
+> The driver creates a *virtual* PID passthrough device alongside the real base.
+> A hidraw node pointing at it opens fine and delivers zero reports forever,
+> which on screen is indistinguishable from dead hardware. The page now says
+> `READING THE WRONG DEVICE` instead of `not connected`, and tells you how to
+> fix it.
+
+### Force feedback test
+
+Hold the button for a second and the wheel is pushed at 25% for 1.5 s each way —
+and **measured** while it happens, by reading `ABS_X` back off the same file
+descriptor that uploads the effect. You get `12776 → 33071  Δ 20295` per
+direction, not a claim that it worked. ABORT stops it and erases the effect.
+
+Measurement goes through evdev rather than the dashboard's own STEER channel on
+purpose: the event node exists whenever the driver is bound, but the hidraw node
+only points at the real base while `hidraw_pid=0` is set.
+
+> The FFB routes physically move the wheel, and this server has no authentication
+> — anything on your LAN can POST them. Start with `--no-ffb` to leave them out.
+
 > Reversal *count* is deliberately not the headline metric: at rest a clean
 > channel's LSB dither reverses on ~50% of samples, so the number looks awful
 > for a healthy channel. It is shown normalised per 100 samples and is only
@@ -101,37 +137,37 @@ wheel for real.
 
 ## Repository layout
 
+Everything diagnostic lives in the web app. What is left outside it is either a
+library it imports, a root installer it can only tell you to run, or the test
+that lets it be changed without the hardware present.
+
 ```
-pedal-web.py        main dashboard (start here)
-hid_layout.py       report-descriptor parser shared by every tool
-tools/              one-shot terminal diagnostics
-setup/              driver install and HID configuration (root)
+pedal-web.py        the dashboard - start here, this is the whole tool
+hid_layout.py       report-descriptor parser + device-node resolution
+sysstate.py         the system checks (root-free detection, never execution)
+ffb.py              the force-feedback test and its measurement
+setup/              root install and HID configuration
+tools/              selftest-decode.py - offline test for all of the above
 docs/FINDINGS.md    the running diagnostic record — read this first
 data/               captured logs kept as evidence for the findings
-attic/              superseded scratch scripts, kept for reference
 ```
+
+### setup/
+
+You do not need to remember these. The dashboard checks whether each one is
+needed and hands you the command with the path already filled in.
+
+| Script | Purpose |
+| --- | --- |
+| `install-ffb.sh` | Installs the `hid-fanatecff` driver via DKMS. Clones upstream into `vendor/` on first run. Root. |
+| `enable-rawhid.sh` | Points HIDRAW at the **real** base instead of the driver's virtual PID device. Needed for raw byte inspection. |
+| `revert-rawhid.sh` | Undoes the above |
 
 ### tools/
 
 | Script | Purpose |
 | --- | --- |
-| `raw-live.py` | Terminal live readout of every channel, plus buttons and hat |
-| `raw-pedal-map.py` | Labelled **raw HID** capture — bypasses driver axis mapping, proves whether an input's data exists in the report at all. Nine guided phases including shift paddles, analog paddles and a hold-the-rim ministick test |
-| `selftest-decode.py` | Replays the archived captures in `data/` through the decoders and asserts the whole report map. **Runs with the base powered off** — use it after touching any offset logic |
-| `pedal-map.py` | Labelled evdev capture per pedal, with a throttle-held twitch check |
-| `ffb-test.py` | Bounded force-feedback test (25% magnitude, 1.5 s each direction) |
-| `js.py` | Joystick axis/button sampler |
-
-Logs are written to `logs/` (gitignored).
-
-### setup/
-
-| Script | Purpose |
-| --- | --- |
-| `install-ffb.sh` | Installs the `hid-fanatecff` driver via DKMS. Clones upstream into `vendor/` on first run. Root. |
-| `verify-ffb.sh` | Checks FF capabilities and effect slots |
-| `enable-rawhid.sh` | Points HIDRAW at the **real** base instead of the driver's virtual PID device. Needed for raw byte inspection. |
-| `revert-rawhid.sh` | Undoes the above |
+| `selftest-decode.py` | Replays the archived capture in `data/` through the decoders and asserts the whole report map, the latching behaviour, the system checks and the FFB state machine. **Runs with the base powered off and cannot move the wheel** — run it after touching any offset logic |
 
 ## Force feedback
 
@@ -145,10 +181,13 @@ DKMS-installed so it survives kernel updates on a rolling release; claims the
 device on fresh enumeration; survives replug and reboot. 12 effect types, 16
 effect slots.
 
+Those numbers were originally captured by hand and then had to be taken on
+trust. They are now reproduced on demand: hold the FFB button in the dashboard
+and it measures the rotation itself.
+
 ```sh
-sudo bash setup/install-ffb.sh
-bash setup/verify-ffb.sh
-python3 tools/ffb-test.py
+sudo bash setup/install-ffb.sh   # only if the system checks say to
+python3 pedal-web.py             # everything else is in the page
 ```
 
 `install-ffb.sh` adds the invoking user to the `games` group for sysfs tuning
@@ -163,6 +202,9 @@ pass `REAL_USER=<name>` explicitly.
   looks exactly like dead hardware. Always resolve through
   `/dev/input/by-id/usb-Fanatec_*-hidraw`, never a hardcoded `hidrawN`, and run
   `setup/enable-rawhid.sh` (`hidraw_pid=0`) before raw inspection.
+  **The dashboard now detects this case and says so** — it parses the
+  descriptor and only calls it the real base if it declares the 33-byte report.
+  Node resolution lives in one place, `hid_layout.find_nodes()`.
 - **The base re-enumerates on replug** (`.0107` → `.0109`), so device paths move.
 - **The base is send-on-change: at rest it transmits nothing at all.** This is
   the single most misleading thing about the rig. "I pressed it and the page did
@@ -179,9 +221,10 @@ pass `REAL_USER=<name>` explicitly.
 
 ## Current state
 
-> **This machine is currently left in the diagnostic HID state** —
-> `hidraw_pid=0` is active via `/etc/modprobe.d/hid-fanatec.conf` and
-> `setup/revert-rawhid.sh` has not been run. Revert it when pedal work is done.
+> **This file no longer tries to tell you what state the machine is in.** It used
+> to carry a hand-written note saying `hidraw_pid=0` was active, which went stale
+> the moment anyone ran `setup/revert-rawhid.sh`. Start the dashboard and read
+> the system checks — they look at the machine instead of remembering it.
 
 Force feedback is done. Pedal diagnosis is open, and the clutch half of it has
 just been reopened:
@@ -192,7 +235,8 @@ just been reopened:
 - **Before resoldering anything**, check whether the rim's analog paddles are
   driving the clutch axis. Fanatec's `ACP` setting makes them do exactly that by
   default, which would produce the same null result the connector-swap bisect
-  saw from a perfectly good jack. `tools/raw-pedal-map.py` phase 6 tests it.
+  saw from a perfectly good jack. Squeeze the analog paddles and watch whether
+  the live motion panel names CLUTCH.
 - The throttle remains suspect: compressed range and ~25× the noise of the brake
   while held still, with a jack that misbehaves when nudged.
 

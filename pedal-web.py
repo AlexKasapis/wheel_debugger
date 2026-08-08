@@ -14,25 +14,41 @@ descriptor at startup (see hid_layout.py), and any mismatch against the
 documented layout is shown as a warning instead of silently mislabelling a
 channel.
 
+It also owns the two things that used to be terminal scripts:
+
+  * the SYSTEM CHECKS (sysstate.py) - whether the driver is bound, whether
+    hidraw points at the real base or the driver's virtual PID device, whether
+    the box is still in diagnostic HID mode, and what force feedback the device
+    advertises. A failing check names the command that fixes it. Nothing here
+    is ever executed: root work stays with the human.
+  * the FORCE FEEDBACK TEST (ffb.py), bounded to 25% for 1.5s per direction and
+    measured through ABS_X so torque is a number, not a claim.
+
 Run:   python3 pedal-web.py
 Then:  open the URL it prints (works from your phone on the same network).
+
+NOTE the FFB routes physically move the wheel and this server has no auth, so
+anyone on the LAN can trigger them. Start with --no-ffb to leave them out.
 
 Standard library only, no dependencies.
 """
 import collections
-import glob
 import http.server
 import json
 import os
 import select
 import socket
 import statistics
+import sys
 import threading
 import time
 
+import ffb
 import hid_layout
+import sysstate
 
 PORT = 8765
+FFB_ENABLED = True   # overridden by --no-ffb in __main__
 
 JUMP = 3000        # sample-to-sample delta that counts as a glitch (16-bit ch)
 GAP = 2.0          # seconds without a report that counts as a dropout
@@ -272,9 +288,11 @@ def reader():
 
     while True:
         try:
-            node = glob.glob('/dev/input/by-id/usb-Fanatec_*-hidraw')[0]
-            path = os.path.realpath(node)
-            layout = hid_layout.layout_for(node)
+            node = hid_layout.find_nodes()['hidraw']
+            if not node:
+                raise FileNotFoundError('no usb-Fanatec_*-hidraw node')
+            path = node['path']
+            layout = hid_layout.layout_for(node['link'])
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         except (IndexError, OSError) as exc:
             with LOCK:
@@ -547,6 +565,13 @@ def snapshot():
                 })
             out['undecoded'] = [i for i in range(len(lo))
                                 if hi[i] != lo[i] and i not in labels]
+
+    # Outside LOCK on purpose. ffb keeps its own tiny state behind its own lock
+    # and does no I/O here, so it rides along on the 10Hz poll and the FFB card
+    # gets live progress for free - but it must not widen the window in which
+    # the reader thread is blocked waiting for a request handler.
+    out['ffb'] = ffb.status()
+    out['ffb_enabled'] = FFB_ENABLED
     return out
 
 
@@ -636,13 +661,85 @@ PAGE = """<!doctype html>
   #motion { font-size:13px; }
   #motion .row { display:flex; gap:10px; align-items:baseline; }
   #motion .nmw { min-width:110px; color:#7ad4ee; }
+
+  /* ---- system checks -------------------------------------------------- */
+  /* Status dots are round and small on purpose: the button grid below uses
+     green for "held down" and red for "stuck", which is a different meaning
+     of the same colours. Different shape keeps the two vocabularies apart. */
+  #sys { border:1px solid #262b34; border-radius:6px; background:#141821;
+         margin-bottom:10px; }
+  #syshead { display:flex; gap:10px; align-items:center; padding:9px 12px;
+             cursor:pointer; user-select:none; }
+  #syshead .caret { color:#5f6878; font-size:10px; margin-left:auto; }
+  #sysbody { display:none; border-top:1px solid #21252d; }
+  #sys.open #sysbody { display:block; }
+  .dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto;
+         background:#5f6878; }
+  .dot.ok { background:#4a9d68; }
+  .dot.warn { background:#c79a3a; }
+  .dot.bad { background:#c4505a; }
+  .chk { display:flex; gap:10px; padding:8px 12px;
+         border-bottom:1px solid #1b1f26; }
+  .chk:last-child { border-bottom:none; }
+  .chk .dot { margin-top:5px; }
+  .chk .lab { flex:0 0 108px; color:#9aa6b8; font-size:12px; }
+  .chk .det { flex:1 1 220px; min-width:0; }
+  .chk .why { color:#5f6878; font-size:11px; margin-top:3px; }
+  /* user-select:all is the point: navigator.clipboard needs a secure context,
+     so it works on localhost and silently does NOTHING over http on the LAN -
+     i.e. on the phone that is actually next to the rig. One tap selects the
+     whole command instead. */
+  .fix { display:block; margin-top:6px; padding:5px 8px; border-radius:4px;
+         background:#0d0f13; border:1px solid #2a313c; color:#7ad4ee;
+         font-size:11.5px; word-break:break-all;
+         user-select:all; -webkit-user-select:all; }
+
+  /* ---- actions -------------------------------------------------------- */
+  #actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+             margin-bottom:4px; }
+  #ffbwrap { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+             flex:1 1 auto; }
+  #hold { position:relative; overflow:hidden; border-color:#7d2b31;
+          touch-action:none; }
+  #hold[disabled] { opacity:.45; cursor:not-allowed; border-color:#39414f; }
+  #hold .fillbar { position:absolute; inset:0 auto 0 0; width:0;
+                   background:#7d2b31; }
+  #hold .lbl { position:relative; }
+  #abort { border-color:#7d2b31; color:#ff9aa2; display:none; }
+  #ffbstat { font-size:12px; color:#8b95a6; }
+  #ffbres { font-size:12px; }
+  #ffbres .nmw { display:inline-block; min-width:56px; color:#7ad4ee; }
+  #err { color:#ff9aa2; font-size:12px; min-height:16px; }
+  #bannerfix:not(:empty) { margin:-4px 0 10px; }
 </style>
 
 <h1>Fanatec wheel/pedal diagnostics</h1>
 <div id="banner">waiting for data...</div>
+<div id="bannerfix"></div>
+
+<div id="sys">
+  <div id="syshead" onclick="toggleSys()">
+    <span class="dot" id="sysdot"></span>
+    <span id="syssum">checking this machine...</span>
+    <span class="caret" id="syscaret">SHOW</span>
+  </div>
+  <div id="sysbody"></div>
+</div>
+
 <div id="warn"></div>
 <div id="info"></div>
-<button onclick="reset()">reset stats &amp; event log</button>
+
+<div id="actions">
+  <button onclick="reset()">reset stats &amp; event log</button>
+  <div id="ffbwrap">
+    <button id="hold" disabled><i class="fillbar"></i><span class="lbl">hold to
+      run FFB test</span></button>
+    <button id="abort" onclick="abortFfb()">ABORT</button>
+    <span id="ffbstat"></span>
+  </div>
+</div>
+<div id="err"></div>
+<div id="ffbres"></div>
 
 <h2>Live motion <span class="sub">(what changed in the last 2 s)</span></h2>
 <div id="motion" class="sub">nothing moving</div>
@@ -746,11 +843,20 @@ function fill(host, list, small) {
 const HAT_CELLS = [7, 0, 1, 6, null, 2, 5, 4, 3];   // NW N NE / W - E / SW S SE
 const HAT_NAME = ['N','NE','E','SE','S','SW','W','NW'];
 
-async function tick() {
-  let d;
-  try { d = await (await fetch('/data')).json(); }
-  catch (e) { return; }
+let SYS = null;          // last /system payload; polled far slower than /data
+let LAST = null;         // last /data payload, for handlers that need it
+let sysTouched = false;  // did the user open/close the panel themselves?
 
+function esc(s) {
+  return String(s).replace(/[&<>"]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function fixHtml(cmd) {
+  return cmd ? '<code class="fix">' + esc(cmd) + '</code>' : '';
+}
+
+function renderBanner(d) {
   const b = document.getElementById('banner');
   // The base is send-on-change, so silence at rest is NORMAL and must not cry
   // wolf. Silence is a clause appended to whatever the headline is, never a
@@ -761,16 +867,38 @@ async function tick() {
       + 'that reads nothing right now proves NOTHING about that control. '
       + 'Turn the wheel to confirm the stream is alive, then retry it.'
     : (d.streaming ? '' : '   |   quiet ' + d.silent_for + 's (normal at rest)');
+  let fix = null;
 
   if (!d.connected) {
     b.className = 'bad';
-    b.textContent = 'DEVICE NOT CONNECTED - ' + d.dev;
+    // "not connected" used to be the end of the story, and the answer was in a
+    // markdown file. The system checks know which of the three causes it is.
+    if (SYS && !SYS.driver_ok) {
+      b.textContent = 'DRIVER NOT LOADED - the fanatec driver has not claimed '
+                    + 'the base, so there is nothing to read.';
+      fix = SYS.driver_fix;
+    } else if (SYS && !SYS.hidraw_real) {
+      b.textContent = 'NO RAW HID SOURCE - ' + SYS.hidraw_detail;
+      fix = SYS.hidraw_fix;
+    } else {
+      b.textContent = 'DEVICE NOT CONNECTED - ' + d.dev;
+    }
   } else if (d.count === 0) {
-    b.className = 'idle';
-    b.textContent = 'device node is open (' + d.dev + ') but the base is sending '
-                  + 'NO reports. Check the base is powered on and out of standby '
-                  + '- it sends nothing at all when it is off. '
-                  + '(' + d.uptime + 's waiting)';
+    // The single most expensive false conclusion this rig produces.
+    if (SYS && !SYS.hidraw_real) {
+      b.className = 'bad';
+      b.textContent = 'READING THE WRONG DEVICE - the node opened, but it is '
+                    + 'not the base: ' + SYS.hidraw_detail + '. It will never '
+                    + 'send anything, which looks exactly like dead hardware '
+                    + 'and is not.';
+      fix = SYS.hidraw_fix;
+    } else {
+      b.className = 'idle';
+      b.textContent = 'device node is open (' + d.dev + ') but the base is sending '
+                    + 'NO reports. Check the base is powered on and out of standby '
+                    + '- it sends nothing at all when it is off. '
+                    + '(' + d.uptime + 's waiting)';
+    }
   } else if (d.glitches > 0) {
     // Latched glitches stay the headline even while the base is silent - that
     // is the whole point of latching, and "come back later and read the page"
@@ -787,7 +915,10 @@ async function tick() {
     b.textContent = 'clean - no glitches   |   ' + d.rate + ' rep/s, '
                   + d.count + ' reports, ' + d.uptime + 's up' + quiet;
   }
+  document.getElementById('bannerfix').innerHTML = fixHtml(fix);
+}
 
+function renderInfo(d) {
   const w = document.getElementById('warn');
   w.style.display = d.warnings.length ? 'block' : 'none';
   w.innerHTML = d.warnings.map(x => 'LAYOUT WARNING: ' + x).join('<br>');
@@ -803,18 +934,24 @@ async function tick() {
   if (d.spare) bits.push('spare bits ' + d.spare.map(x =>
       '0x' + x.toString(16).padStart(2, '0')).join(' '));
   document.getElementById('info').textContent = bits.join('   |   ');
+}
 
+function renderAxes(d) {
   const wide = d.axes.filter(a => a.bits === 16);
   const narrow = d.axes.filter(a => a.bits !== 16);
   fill(document.getElementById('chans'), wide, false);
   fill(document.getElementById('aux'), narrow, true);
+}
 
+function renderMotion(d) {
   document.getElementById('motion').innerHTML = d.motion.length
     ? d.motion.map(m => '<div class="row"><span class="nmw">' + m.name
         + '</span><span>moved ' + m.move + '  (' + m.pct
         + '% of range, byte ' + m.byte + ')</span></div>').join('')
     : '<span class="sub">nothing moving</span>';
+}
 
+function renderHat(d) {
   if (d.hat) {
     document.getElementById('hatgrid').innerHTML = HAT_CELLS.map(v => {
       if (v === null) return '<div class="h">--</div>';
@@ -828,7 +965,9 @@ async function tick() {
       + ' low nibble   |   directions seen: '
       + (d.hat.ever.length ? d.hat.ever.map(v => HAT_NAME[v]).join(' ') : 'none');
   }
+}
 
+function renderButtons(d) {
   document.getElementById('btns').innerHTML = d.buttons.map(x =>
     '<div class="k' + (x.stuck ? ' stuck' : x.on ? ' on' : x.ever ? ' ever' : '')
     + '" title="button ' + x.n + (x.fn ? ' - ' + x.fn : '')
@@ -839,13 +978,17 @@ async function tick() {
     'seen ' + seen.length + ' of ' + d.buttons.length + ': '
     + (seen.length ? seen.join(', ') : 'none yet')
     + '   |   hover a cell for its rim function and report bit';
+}
 
+function renderEvents(d) {
   document.getElementById('events').innerHTML = d.events.length
     ? d.events.map(e =>
         '<tr><td>' + e.t + '</td><td class="hot">' + e.kind + '</td><td>'
         + e.ch + '</td><td>' + e.detail + '</td></tr>').join('')
     : '<tr><td colspan="4" class="sub">nothing caught yet</td></tr>';
+}
 
+function renderBytes(d) {
   document.getElementById('bytes').innerHTML = d.bytes.map(x =>
     '<div class="b' + (x.moved ? ' moved' : '') + (x.known ? ' known' : '')
     + '" title="byte ' + x.i + ' (' + x.label + '): seen ' + x.lo + '-' + x.hi + '">'
@@ -859,9 +1002,174 @@ async function tick() {
   document.getElementById('hex').textContent = d.hex;
 }
 
-async function reset() { await fetch('/reset', {method: 'POST'}); tick(); }
+/* ---- system checks ---------------------------------------------------- */
+
+function toggleSys() {
+  sysTouched = true;
+  const el = document.getElementById('sys');
+  el.classList.toggle('open');
+  document.getElementById('syscaret').textContent =
+    el.classList.contains('open') ? 'HIDE' : 'SHOW';
+}
+
+function renderSystem(s) {
+  SYS = s;
+  document.getElementById('sysdot').className = 'dot ' + s.overall;
+  document.getElementById('syssum').textContent = s.summary;
+  document.getElementById('sysbody').innerHTML = s.checks.map(c =>
+    '<div class="chk"><span class="dot ' + c.status + '"></span>'
+    + '<span class="lab">' + esc(c.label) + '</span>'
+    + '<span class="det">' + esc(c.detail)
+    + (c.why ? '<div class="why">' + esc(c.why) + '</div>' : '')
+    + fixHtml(c.fix)
+    + '</span></div>').join('');
+  // Open itself when something is actually broken, but never fight a user who
+  // has already decided how they want it.
+  if (s.overall === 'bad' && !sysTouched
+      && !document.getElementById('sys').classList.contains('open')) {
+    toggleSys();
+    sysTouched = false;
+  }
+  if (LAST) renderFfb(LAST);
+}
+
+/* ---- force feedback --------------------------------------------------- */
+
+const PHASE_TEXT = {arming: 'arming', left: 'pushing LEFT', pause: 'pause',
+                    right: 'pushing RIGHT', erasing: 'erasing effect'};
+
+function measured(label, m) {
+  if (!m) return '';
+  if (!m.samples) {
+    return '<div><span class="nmw">' + label + '</span> <span class="hot">'
+         + esc(m.note) + '</span></div>';
+  }
+  const good = m.moved;
+  return '<div><span class="nmw">' + label + '</span> '
+       + m.first + ' &rarr; ' + m.last
+       + '  <b class="' + (good ? 'ok' : 'hot') + '">&Delta; ' + m.delta + '</b>'
+       + '  <span class="tiny">(min ' + m.min + ', max ' + m.max + ', '
+       + m.samples + ' samples of ABS_X)</span></div>';
+}
+
+function renderFfb(d) {
+  const f = d.ffb, hold = document.getElementById('hold');
+  document.getElementById('abort').style.display =
+    f.running ? 'inline-block' : 'none';
+
+  let stat;
+  if (f.running) {
+    stat = (PHASE_TEXT[f.phase] || f.phase) + '   (' + f.elapsed + 's)';
+  } else if (f.phase === 'done') {
+    stat = 'complete in ' + f.elapsed + 's';
+  } else if (f.phase === 'aborted') {
+    stat = 'ABORTED - effect erased';
+  } else if (f.phase === 'failed') {
+    stat = 'FAILED: ' + f.error;
+  } else if (!d.ffb_enabled) {
+    stat = 'disabled with --no-ffb';
+  } else if (SYS && !SYS.ffb_ok) {
+    stat = SYS.ffb_reason;
+  } else {
+    stat = 'constant force, ' + f.magnitude_pct + '% for '
+         + (f.duration_ms / 1000) + 's each way - the wheel WILL move';
+  }
+  document.getElementById('ffbstat').textContent = stat;
+
+  hold.disabled = !d.ffb_enabled || f.running || !(SYS && SYS.ffb_ok);
+
+  const r = f.result || {};
+  const rows = measured('LEFT', r.left) + measured('RIGHT', r.right);
+  const both = r.left && r.right;
+  document.getElementById('ffbres').innerHTML = rows + (
+    both
+      ? '<div class="tiny" style="margin-top:4px">'
+        + (r.left.moved && r.right.moved
+            ? 'torque confirmed in both directions - measured, not inferred'
+            : 'the motor did not move the wheel measurably; check that the '
+              + 'external PSU is on (USB power runs the logic only)')
+        + '</div>'
+      : '');
+}
+
+const HOLD_MS = 1200;
+let holdRaf = null, holdStart = 0;
+
+function holdStep() {
+  const bar = document.querySelector('#hold .fillbar');
+  const p = Math.min(1, (Date.now() - holdStart) / HOLD_MS);
+  bar.style.width = (p * 100) + '%';
+  if (p >= 1) { holdCancel(); startFfb(); return; }
+  holdRaf = requestAnimationFrame(holdStep);
+}
+
+function holdBegin(ev) {
+  if (document.getElementById('hold').disabled) return;
+  ev.preventDefault();
+  holdStart = Date.now();
+  holdRaf = requestAnimationFrame(holdStep);
+}
+
+function holdCancel() {
+  if (holdRaf) cancelAnimationFrame(holdRaf);
+  holdRaf = null;
+  document.querySelector('#hold .fillbar').style.width = '0';
+}
+
+/* ---- plumbing --------------------------------------------------------- */
+
+async function post(path) {
+  const e = document.getElementById('err');
+  e.textContent = '';
+  try {
+    const r = await fetch(path, {method: 'POST'});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) {
+      e.textContent = j.msg || ('request failed: HTTP ' + r.status);
+      return false;
+    }
+    return true;
+  } catch (ex) {
+    e.textContent = 'request failed: ' + ex;
+    return false;
+  }
+}
+
+async function reset() { await post('/reset'); tick(); }
+async function startFfb() { await post('/ffb/start'); tick(); }
+async function abortFfb() { await post('/ffb/abort'); tick(); }
+
+async function tick() {
+  let d;
+  try { d = await (await fetch('/data')).json(); }
+  catch (e) { return; }
+  LAST = d;
+  renderBanner(d);
+  renderInfo(d);
+  renderAxes(d);
+  renderMotion(d);
+  renderHat(d);
+  renderButtons(d);
+  renderEvents(d);
+  renderBytes(d);
+  renderFfb(d);
+}
+
+async function pollSystem() {
+  try { renderSystem(await (await fetch('/system')).json()); }
+  catch (e) { /* keep the last good state rather than blanking the strip */ }
+}
+
+const hold = document.getElementById('hold');
+hold.addEventListener('pointerdown', holdBegin);
+['pointerup', 'pointercancel', 'pointerleave'].forEach(
+  n => hold.addEventListener(n, holdCancel));
+
 setInterval(tick, 100);
+// System state is filesystem reads, not the hot path - poll it far slower.
+setInterval(pollSystem, 3000);
 tick();
+pollSystem();
 </script>
 """
 
@@ -869,17 +1177,24 @@ tick();
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
-    def _send(self, body, ctype):
-        self.send_response(200)
+    def _send(self, body, ctype, code=200):
+        self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, obj, code=200):
+        self._send(json.dumps(obj).encode(), 'application/json', code)
+
     def do_GET(self):
         if self.path.startswith('/data'):
-            self._send(json.dumps(snapshot()).encode(), 'application/json')
+            self._json(snapshot())
+        elif self.path.startswith('/system'):
+            # Cached with its own TTL in sysstate, so a browser polling this
+            # every few seconds costs one set of filesystem reads, not many.
+            self._json(sysstate.state())
         elif self.path == '/':
             self._send(PAGE.encode(), 'text/html; charset=utf-8')
         else:
@@ -889,7 +1204,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == '/reset':
             with LOCK:
                 reset_tracking()
-            self._send(b'{"ok":true}', 'application/json')
+            self._json({'ok': True})
+        elif self.path == '/ffb/start':
+            if not FFB_ENABLED:
+                self._json({'ok': False, 'msg': 'FFB disabled (--no-ffb)'}, 403)
+                return
+            ok, msg = ffb.start()
+            # 409 for "already running" so a double-tap on a phone cannot
+            # stack two effect uploads on the same slot.
+            self._json({'ok': ok, 'msg': msg}, 200 if ok else 409)
+        elif self.path == '/ffb/abort':
+            ok, msg = ffb.abort()
+            self._json({'ok': ok, 'msg': msg})
         else:
             self.send_error(404)
 
@@ -909,6 +1235,12 @@ def lan_ip():
 
 
 if __name__ == '__main__':
+    # The FFB routes physically move the wheel and this server has no auth, so
+    # anything on the LAN can POST them. Fine for a rig on a home network, but
+    # it should be one flag to take that off the table.
+    if '--no-ffb' in sys.argv:
+        FFB_ENABLED = False
+
     threading.Thread(target=reader, daemon=True).start()
     srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
     ip = lan_ip()

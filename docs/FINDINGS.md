@@ -197,25 +197,26 @@ taken as "0x00 = fallback mapping".
    nothing — which is **exactly** the swap-bisect's null result.
    => The "clutch-IN channel is DEAD" conclusion below is **NOT safe**. Do not
    resolder the board yet.
-   Test: `tools/raw-pedal-map.py` PHASE 6 — squeeze the analog paddles and watch
-   CLUTCH / SLIDER / DIAL. If a paddle moves byte 22, the channel is alive and
-   merely overridden. `ACP` cannot be read from sysfs (see above); read it from
-   the base's own tuning display instead.
+   Test: squeeze the analog paddles and watch CLUTCH / SLIDER / DIAL in the
+   dashboard's live-motion panel. If a paddle moves byte 22, the channel is
+   alive and merely overridden. `ACP` cannot be read from sysfs (see above);
+   read it from the base's own tuning display instead.
 3. **Do the shift paddles report at all?** They are buttons 5 and 6. The one
    prior evdev capture saw buttons 1-4, 7-12, 22, 24, 26 and **not** 5 or 6 —
    but that capture was for pedals and never asked for paddle presses, so it is
-   not evidence. Test: `tools/raw-pedal-map.py` PHASE 5, or press them and watch
-   the dashboard's button grid go blue.
+   not evidence. Test: press them and watch the dashboard's button grid — cells
+   5 and 6 go blue on the first press, and a `BTN-NEW` event is latched.
 4. **Does the ministick really move STEER?** The descriptor says no: STEER is
    X at byte 16, the ministick is Rx/Ry at bytes 24-25 — separate fields.
    The likely explanation for what was observed is mechanical: pushing a thumb
    stick on a rim that does not self-centre and has FFB idle **physically
    rotates the wheel**. A contributing factor was the dashboard's auto-scaled
    sparkline, which drew ±30 LSB of resting ADC dither as a full-height wiggle.
-   Test: **hold the rim firmly still** and move only the ministick
-   (`raw-pedal-map.py` PHASE 7). STEER dithering by tens of LSB = independent,
-   as declared. STEER swinging thousands of LSB with the rim held = something
-   really is shared, and ACP mode 4 becomes the suspect.
+   Test: **hold the rim firmly still** and move only the ministick, then read
+   the live-motion panel — it names whichever field actually changed. STEER
+   dithering by tens of LSB = independent, as declared. STEER swinging thousands
+   of LSB with the rim held = something really is shared, and ACP mode 4 becomes
+   the suspect.
 
 ## Hardware
 - Wheel base: Endor AG FANATEC CSL Elite Wheel Base, USB `0eb7:0e03`
@@ -514,12 +515,29 @@ was ruined. ALWAYS mark pot body->shaft with a marker + photo before removing.
                       ADC dither can no longer masquerade as movement, and every
                       16-bit channel also gets an absolute full-scale bar.
                       Stdlib only.
-- `raw-live.py`     — terminal-only live readout, all channels + buttons + hat
-- `selftest-decode.py` — replays the archived captures in `data/` through the
-                      decoders and asserts the report map. Runs with the base
-                      powered OFF; use it after touching any offset logic.
+                      Also owns the SYSTEM CHECKS and the FFB TEST — see below.
+- `sysstate.py`     — answers "is this machine in a state where the page can be
+                      believed": driver bound, hidraw pointing at the REAL base
+                      vs the driver's virtual PID device (decided by parsing the
+                      descriptor, not by guessing), diagnostic HID mode still
+                      active, udev rule, FF capability bitmask, and whether the
+                      `games` re-login has happened. Pure filesystem reads, no
+                      root, nothing executed — a failing check hands you the
+                      command and stops there.
+- `ffb.py`          — bounded FFB test (CONSTANT, 25%, 1.5 s each way) that
+                      MEASURES itself by reading ABS_X off the same O_RDWR fd
+                      that uploads the effect. The delta-20295 numbers below no
+                      longer depend on a capture nobody kept.
+- `selftest-decode.py` — replays the archived capture in `data/` through the
+                      decoders and asserts the report map, the latch, the system
+                      checks and the FFB state machine. Runs with the base
+                      powered OFF and cannot move the wheel; use it after
+                      touching any offset logic.
 - `install-ffb.sh`  — root install (already run successfully)
-- `verify-ffb.sh`   — checks ff caps + effects (note: its js-node glob and
-                      driver readlink are cosmetically wrong; ff decode in it
-                      mislabels bits — use the sysfs `capabilities/ff` decode)
-- `js.py`           — joystick axis/button sampler
+
+~~`raw-live.py`, `raw-pedal-map.py`, `pedal-map.py`, `ffb-test.py`, `js.py`,
+`verify-ffb.sh`, `attic/`~~ — DELETED. The dashboard is the author of all of it
+now. `verify-ffb.sh` in particular mislabelled the FF bits; `sysstate.py` decodes
+the sysfs `capabilities/ff` bitmask instead, which needs no device open at all.
+The archived logs in `data/` are kept — they are the evidence behind everything
+above, and the self-test reads its fixtures straight out of them.

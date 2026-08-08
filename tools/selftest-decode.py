@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Self-test for the raw-HID decoders - runs with the base powered OFF.
+"""Self-test for the dashboard - runs with the base powered OFF.
 
 Replays the real reports archived in data/raw-pedal-map.log through
-hid_layout.py and pedal-web.py's decoders and asserts the result. This exists
-because every "the dashboard does not show my clutch / my buttons" bug in this
-project came from an unverified byte offset, and the base only streams while
-someone is physically at the rig.
+hid_layout.py, sysstate.py and pedal-web.py's decoders and asserts the result.
+This exists because every "the dashboard does not show my clutch / my buttons"
+bug in this project came from an unverified byte offset, and the base only
+streams while someone is physically at the rig - so without this, changing a
+decoder means going and sitting in the seat to find out what broke.
 
 If /dev/hidraw for the base is readable the layout comes from the device's own
 report descriptor; otherwise the hardcoded CSL Elite fallback is tested.
 
+Nothing here opens a device for I/O and nothing here can move the wheel.
+
 Run:  python3 tools/selftest-decode.py
 """
-import glob
 import importlib.util
 import json
 import os
@@ -22,7 +24,9 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import ffb                                                 # noqa: E402
 import hid_layout                                          # noqa: E402
+import sysstate                                            # noqa: E402
 
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -32,7 +36,6 @@ def _load(name, path):
 
 
 pw = _load('pedal_web', os.path.join(ROOT, 'pedal-web.py'))
-rpm = _load('raw_pedal_map', os.path.join(ROOT, 'tools', 'raw-pedal-map.py'))
 
 FAILS = []
 
@@ -49,20 +52,40 @@ def hx(s):
     return bytes(int(x, 16) for x in s.split())
 
 
-# Verbatim first-report hex from data/raw-pedal-map.log, one per capture phase.
-# Nothing but the pedal named in each phase was touched.
-STEER_PHASE = hx('08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 16 0f 80 ff ff '
-                 'ff ff ff ff 00 00 ff fc 27 02 20 b5 02')
-THR_PHASE = hx('08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 16 5d 81 39 ff '
-               'ff ff ff ff 00 00 ff fc 27 02 20 b5 02')
-BRK_PHASE = hx('08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 16 5d 81 ff ff '
-               '7f ff ff ff 00 00 ff fc 27 02 20 b5 02')
+CAPTURE = os.path.join(ROOT, 'data', 'raw-pedal-map.log')
+
+
+def load_phases(path):
+    """{phase name: first raw report} from an archived labelled capture.
+
+    Read at runtime rather than pasted in as hex. These bytes used to be copied
+    out of this log by hand, which meant the log and the fixture could drift
+    apart silently and the test would keep asserting bytes nothing produces any
+    more. If the evidence file goes missing the test now fails loudly, which is
+    the correct outcome: the archived capture IS the fixture.
+    """
+    phases, name = {}, None
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith('PHASE ') and '-' in line:
+                name = line.split('-', 1)[1].strip()
+            elif line.startswith('first:') and name:
+                phases[name] = hx(line.split(':', 1)[1])
+    return phases
+
+
+PHASES = load_phases(CAPTURE)
+# Nothing but the control named in each phase was touched during the capture.
+STEER_PHASE = PHASES['STEERING']
+THR_PHASE = PHASES['THROTTLE']
+BRK_PHASE = PHASES['BRAKE']
 
 
 def get_layout():
-    found = glob.glob('/dev/input/by-id/usb-Fanatec_*-hidraw')
-    if found and os.access(os.path.realpath(found[0]), os.R_OK):
-        return hid_layout.layout_for(found[0]), 'live device descriptor'
+    node = hid_layout.find_nodes()['hidraw']
+    if node and os.access(node['path'], os.R_OK):
+        return hid_layout.layout_for(node['link']), 'live device descriptor'
     return hid_layout.fallback_layout('no readable base'), 'hardcoded fallback'
 
 
@@ -274,29 +297,108 @@ def main():
     ck('a bit high in the first report IS called stuck',
        next(b['stuck'] for b in pw.snapshot()['buttons'] if b['n'] == 6), True)
 
-    print('\n[7] tools/raw-pedal-map.py phase analysis')
-    lines, one = rpm.analyse([], layout)
-    ck('empty phase is reported as a real result',
-       'NO REPORTS AT ALL' in lines[0], True)
-    ck('empty phase summary', one, 'NO REPORTS - no response at all')
-    lines, one = rpm.analyse([STEER_PHASE, THR_PHASE], layout)
-    # the summary line names the biggest mover by % of range; between these two
-    # frames STEER moved 334 LSB and THROTTLE 198, so STEER wins
-    ck('summary names the biggest mover', one.split()[0], 'STEER')
-    ck('both movers listed in full',
-       [x.strip().split()[0] for x in lines if x.startswith('    ')],
-       ['STEER', 'THROTTLE'])
-    ck('reports no buttons down',
-       any('no button bit went down' in x for x in lines), True)
-    ck('no stray undecoded bytes',
-       any('UNDECODED' in x for x in lines), False)
-    lines, one = rpm.analyse([STEER_PHASE, bytes(gear)], layout)
-    ck('labels button 5 by function',
-       any('GEAR UP' in x for x in lines), True)
-    ck('phase 4/6 clutch sweep is attributed to CLUTCH',
-       'CLUTCH' in rpm.analyse(stream, layout)[1], True)
-    ck('every report byte is accounted for',
-       sorted(set(range(33)) - rpm.decoded_bytes(layout)), [])
+    print('\n[7] byte accounting and the jitter maths')
+    labels = pw.byte_labels(layout)
+    ck('every report byte is claimed by some field',
+       sorted(set(range(layout['size'])) - set(labels)), [])
+    ck('byte 22 is CLUTCH', labels[22], 'CLUTCH')
+    ck('byte 0 carries the hat and the first buttons', labels[0], 'hat + buttons')
+    ck('the vendor block is claimed',
+       {labels[b] for b in layout['vendor']}, {'vendor'})
+
+    # If a byte starts moving that the descriptor does not claim, something new
+    # is reporting and the page has to say so - it is how an undocumented field
+    # would ever be noticed at all.
+    orphan = layout['vendor'][-1]
+    pw.reset_tracking()
+    pw.install_layout(dict(layout, vendor=layout['vendor'][:-1]))
+    pw.STATE['lo'] = list(STEER_PHASE)
+    pw.STATE['hi'] = list(STEER_PHASE)
+    pw.STATE['hi'][orphan] ^= 0x01
+    pw.STATE['report'] = STEER_PHASE
+    ck('a byte that moves and nothing claims is flagged',
+       orphan in pw.snapshot()['undecoded'], True)
+    pw.reset_tracking()
+    pw.install_layout(layout)
+
+    # Reversal count is what separated the healthy brake (11 in 417 samples)
+    # from the faulty throttle (248 in 401 while held motionless).
+    ck('a clean sweep never reverses', pw.reversals([0, 10, 20, 30]), 0)
+    ck('one direction change is one reversal', pw.reversals([0, 10, 5]), 1)
+    ck('resting dither reverses on nearly every sample',
+       pw.reversals([100, 101, 100, 101, 100]), 3)
+    ck('a flat channel never reverses', pw.reversals([5, 5, 5, 5]), 0)
+
+    print('\n[8] system checks (sysstate.py)')
+    st = sysstate.state(force=True)
+    ck('every check is fully formed',
+       all(set(c) == {'id', 'label', 'status', 'detail', 'fix', 'why'}
+           for c in st['checks']), True)
+    ck('every status is one of the four',
+       sorted({c['status'] for c in st['checks']}
+              - {'ok', 'warn', 'bad', 'unknown'}), [])
+    ck('overall is the worst check present', sysstate.RANK[st['overall']],
+       max(sysstate.RANK[c['status']] for c in st['checks']))
+    # A failing check that does not tell you what to do about it is just an
+    # alarm, which is the thing this whole panel exists to stop being.
+    ck('every failing check offers a fix or a reason',
+       all(c['fix'] or c['why'] for c in st['checks'] if c['status'] == 'bad'),
+       True)
+    ck('the summary is JSON-serialisable', bool(json.dumps(st)), True)
+    # The bitmask this base actually reports, per docs/FINDINGS.md.
+    ck('the FF bitmask decodes to the 12 effects FINDINGS recorded',
+       sysstate.decode_ff('1f7f0000 0'),
+       ['RUMBLE', 'PERIODIC', 'CONSTANT', 'SPRING', 'FRICTION', 'DAMPER',
+        'INERTIA', 'SQUARE', 'TRIANGLE', 'SINE', 'SAW_UP', 'SAW_DOWN'])
+    ck('RAMP and CUSTOM are correctly absent',
+       {'RAMP', 'CUSTOM'} & set(sysstate.decode_ff('1f7f0000 0')), set())
+    ck('an empty bitmask means no force feedback', sysstate.decode_ff('0'), [])
+
+    print('\n[9] force-feedback control (ffb.py - no device is touched)')
+    fst = ffb.status()
+    ck('starts idle', fst['phase'], 'idle')
+    ck('nothing running', fst['running'], False)
+    ck('magnitude stays gentle', fst['magnitude_pct'] <= 30, True)
+    ck('each push is bounded in time', fst['duration_ms'] <= 2000, True)
+    ck('the effect carries its own stop', ffb.DURATION_MS > 0, True)
+    ck('aborting with nothing running is a no-op', ffb.abort()[0], False)
+    ck('status is JSON-serialisable', bool(json.dumps(fst)), True)
+
+    # Single flight, checked BEFORE the device is looked at: a double-tap on a
+    # phone must not stack two effect uploads onto the same slot.
+    with ffb._LOCK:
+        ffb._STATE['running'] = True
+    try:
+        ok, msg = ffb.start()
+    finally:
+        with ffb._LOCK:
+            ffb._STATE['running'] = False
+    ck('refuses to start a second test', ok, False)
+    ck('and says one is already running', 'already running' in msg, True)
+
+    class _NoDevice:
+        @staticmethod
+        def node_path(_kind):
+            return None
+
+    class _Unwritable:
+        @staticmethod
+        def node_path(_kind):
+            return '/nonexistent/fanatec-event-node'
+
+    real = ffb.hid_layout
+    try:
+        ffb.hid_layout = _NoDevice
+        ok, msg = ffb.start()
+        ck('refuses to start with no event node', ok, False)
+        ck('and says so', 'no Fanatec event node' in msg, True)
+        ffb.hid_layout = _Unwritable
+        ok, msg = ffb.start()
+        ck('refuses to start when the node is not writable', ok, False)
+        ck('and names the permission problem', 'not writable' in msg, True)
+    finally:
+        ffb.hid_layout = real
+    ck('a refused start leaves it idle', ffb.status()['running'], False)
 
     print()
     if FAILS:

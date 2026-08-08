@@ -25,6 +25,19 @@ Verified against the CSL Elite base (0eb7:0e03), which yields:
 
 Standard library only.
 """
+import glob
+import os
+
+# The base re-enumerates on replug (.0107 -> .0109), so a hardcoded hidrawN or
+# eventN goes stale without warning. Everything resolves through the udev by-id
+# symlinks instead, and it resolves through THIS module so there is exactly one
+# place that knows the names.
+BY_ID = '/dev/input/by-id'
+NODE_GLOBS = {
+    'hidraw': 'usb-Fanatec_*-hidraw',
+    'event': 'usb-Fanatec_*-event-joystick',
+    'js': 'usb-Fanatec_*-joystick',
+}
 
 # usage (page, id) -> (dashboard name, HID axis name)
 AXIS_USAGES = {
@@ -228,9 +241,31 @@ def fallback_layout(reason):
     }
 
 
+def find_nodes():
+    """Locate the base's device nodes. {kind: {'link','path'} or None}.
+
+    kind is 'hidraw' (raw reports), 'event' (evdev, and the only node force
+    feedback can be driven through) or 'js' (legacy joystick API).
+    """
+    found = {}
+    for kind, pattern in NODE_GLOBS.items():
+        links = sorted(glob.glob(os.path.join(BY_ID, pattern)))
+        if kind == 'js':
+            # '*-joystick' also matches '*-event-joystick'
+            links = [x for x in links if not x.endswith('-event-joystick')]
+        found[kind] = ({'link': links[0], 'path': os.path.realpath(links[0])}
+                       if links else None)
+    return found
+
+
+def node_path(kind):
+    """Realpath of one node, or None. Convenience over find_nodes()."""
+    node = find_nodes()[kind]
+    return node['path'] if node else None
+
+
 def layout_for(hidraw_path):
     """Best layout available for /dev/hidrawN, descriptor first."""
-    import os
     node = os.path.basename(os.path.realpath(hidraw_path))
     sysfs = f'/sys/class/hidraw/{node}/device/report_descriptor'
     try:
@@ -249,13 +284,12 @@ def layout_for(hidraw_path):
 
 
 if __name__ == '__main__':
-    import glob
     import json
     import sys
     target = sys.argv[1] if len(sys.argv) > 1 else None
     if not target:
-        found = glob.glob('/dev/input/by-id/usb-Fanatec_*-hidraw')
-        if not found:
+        node = find_nodes()['hidraw']
+        if not node:
             sys.exit('no Fanatec hidraw node found; pass one explicitly')
-        target = found[0]
+        target = node['link']
     print(json.dumps(layout_for(target), indent=2))

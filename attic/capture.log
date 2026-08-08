@@ -1,9 +1,0 @@
-hidraw=/dev/hidraw8  evdev=/dev/input/event6
-
-=== 0 raw HID reports, 0 evdev events in 90s ===
-!! base sent NOTHING -- it is not transmitting at all
-
-=== sysfs after capture ===
-  wheel_id: 0x00
-  fw_version: 0
-  range: 0

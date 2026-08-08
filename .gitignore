@@ -1,6 +1,3 @@
-# captured at runtime
-logs/
-
 # upstream driver source, cloned by setup/install-ffb.sh - not our code
 vendor/
 
