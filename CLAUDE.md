@@ -12,7 +12,7 @@ Standard library only, no venv, no build step, no test framework.
 
 ```sh
 python3 pedal-web.py --no-ffb      # the dashboard on :8765 — use this form
-python3 tools/selftest-decode.py   # 112 assertions, base can be powered off
+python3 tools/selftest-decode.py   # 117 assertions, base can be powered off
 python3 tools/bracket-capture.py   # scripted capture, needs someone at the rig
 python3 sysstate.py                # machine state as JSON
 python3 hid_layout.py [node]       # parsed report layout as JSON
@@ -121,9 +121,11 @@ from the descriptor, so they stay — but its length guard reads
   (which buckets of the range were ever occupied) are separate storage from
   `Tracker.hist` (rolling window), so a press that ages out of the sparkline is
   still latched in both. The dashboard exists to catch faults nobody was watching
-  for. `cover` is sized to the layout and so is rebuilt with `hist` in
-  `_install()`: its buckets are positions in *that* layout's logical range and
-  mean nothing across a layout change.
+  for. `cover` outlives a replug too — reseating a jack is *part of* the
+  diagnosis, so `_install()` carries a channel's buckets across a reconnect, but
+  only where `(name, lmin, lmax)` is unchanged: buckets are positions in one
+  logical range and mean nothing on another. `reset()` still wipes them, via the
+  empty `cover` `_reset()` leaves for `_install()` to rebuild from.
 - **The base is send-on-change: at rest it transmits nothing.** So "no data"
   never distinguishes a dead control from a silent base, and every pedal test
   needs a positive control in the same window. This is why `DROPOUT` is logged

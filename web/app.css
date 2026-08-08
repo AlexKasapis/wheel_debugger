@@ -14,7 +14,10 @@ h2 { font-size:12px; margin:22px 0 8px; color:#7d8798; font-weight:600;
         display:none; }
 #info { color:#8b95a6; font-size:12px; margin-bottom:12px; }
 .grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); }
-.grid.sm { grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
+/* align-items:start, or the slider and dial cards stretch to the height of the
+   ministick pad beside them and read as broken */
+.grid.sm { grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+           align-items:start; }
 .card { background:#171a20; border:1px solid #262b34; border-radius:8px; padding:12px; }
 .card.warn { border-color:#7d2b31; }
 .card.idle { border-style:dashed; border-color:#39414f; }

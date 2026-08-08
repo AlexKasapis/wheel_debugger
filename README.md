@@ -100,7 +100,7 @@ reachable without a base attached.
 `tools/selftest-decode.py` replays the archived capture in `data/` through
 `Tracker.ingest()` — the same call the reader thread makes — and asserts the
 whole report map, the latching behaviour, the system checks and the FFB state
-machine. 112 checks. It runs with the base powered off and cannot move the wheel;
+machine. 117 checks. It runs with the base powered off and cannot move the wheel;
 run it after touching any offset logic.
 
 `tools/bracket-capture.py` is the same pipeline pointed at a scripted sequence:

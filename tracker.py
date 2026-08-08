@@ -78,6 +78,9 @@ class Tracker:
         self.btn = {}
         self.hat_value = None
         self.hat_ever = set()
+        # emptied here, rebuilt in _install() - which is what makes reset() wipe
+        # coverage while connect() carries it across a replug
+        self.cover = {}
         self._clear_stream_state()
 
     def _clear_stream_state(self):
@@ -92,12 +95,20 @@ class Tracker:
 
     def _install(self, layout):
         """Adopt a layout and size the history to it. Caller holds the lock."""
+        # Coverage is a latch, and reseating a jack is part of the diagnosis, so
+        # it has to survive the reconnect that follows - but only per channel and
+        # only where a bucket still means the same thing. A changed logical range
+        # makes the old counts positions on a different scale.
+        was = {ax['name']: (ax['lmin'], ax['lmax']) for ax in self.layout['axes']}
+        kept = self.cover
         self.layout = layout
         self.hist = {ax['name']: collections.deque(maxlen=HIST_LEN)
                      for ax in layout['axes']}
-        # Buckets are positions in *this* layout's logical range, so they are
-        # meaningless across a layout change and get rebuilt with the history.
-        self.cover = {ax['name']: [0] * COVER for ax in layout['axes']}
+        self.cover = {
+            ax['name']: (kept[ax['name']]
+                         if was.get(ax['name']) == (ax['lmin'], ax['lmax'])
+                         and ax['name'] in kept else [0] * COVER)
+            for ax in layout['axes']}
 
     def reset(self):
         with self._lock:

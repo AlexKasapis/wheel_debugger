@@ -212,6 +212,29 @@ def main():
     # 65535 must land in the last bucket, not one past the end
     ck('a channel resting at the rail is in the top bucket',
        axes['THROTTLE']['cover'][-1], len(stream))
+    # the lmin offset is the bit most likely to be wrong, and only a signed
+    # channel exercises it: DIAL rests at -4 of -128..127, just below middle
+    ck('a signed channel buckets around its own zero',
+       [i for i, n in enumerate(axes['DIAL']['cover']) if n],
+       [(-4 + 128) * tracker.COVER // 256])
+
+    # Reseating a jack is in the diagnosis, so the reconnect it causes must not
+    # wipe the latch that outlives it. The layout is unchanged, so are the
+    # buckets; a channel whose declared range moved cannot keep them.
+    before = list(axes['CLUTCH']['cover'])
+    track.connect('/dev/hidraw-replugged', layout)
+    after = {a['name']: a for a in track.snapshot()['axes']}
+    ck('a replug keeps the coverage latch', after['CLUTCH']['cover'], before)
+    ck('and the sparkline is dropped with the connection',
+       after['CLUTCH']['spark'], [])
+    moved = dict(layout, axes=[dict(a, lmax=1023) if a['name'] == 'CLUTCH' else a
+                               for a in layout['axes']])
+    track.connect('/dev/hidraw-replugged', moved)
+    after = {a['name']: a for a in track.snapshot()['axes']}
+    ck('but a channel whose range changed starts over',
+       sum(after['CLUTCH']['cover']), 0)
+    ck('without disturbing the channels that did not',
+       after['THROTTLE']['cover'][-1], len(stream))
 
     # The latch must outlive the rolling sparkline window, or a channel that
     # demonstrably worked reads as dead once HIST_LEN further reports arrive.

@@ -66,7 +66,11 @@ function coverStrip(cv, buckets) {
     // it spends passing through, which on a linear scale erases the sweep
     const t = Math.log(1 + n) / Math.log(1 + top);
     g.fillStyle = 'rgba(95,176,255,' + (0.2 + 0.8 * t).toFixed(3) + ')';
-    g.fillRect(i * cw, 0, Math.ceil(cw), h);
+    // both edges rounded the same way, so neighbours share an exact boundary:
+    // a cell bleeding over the next one narrows the single-bucket gap that is
+    // the whole point of this strip
+    const x = Math.round(i * cw);
+    g.fillRect(x, 0, Math.max(1, Math.round((i + 1) * cw) - x), h);
   });
 }
 
