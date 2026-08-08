@@ -27,13 +27,56 @@ AXIS_USAGES = {
 }
 HAT_USAGE = (0x01, 0x39)
 BUTTON_PAGE = 0x09
+VENDOR_PAGE = 0xff00
 
-# The fallback layout, and a sanity check on whatever we parse.
-KNOWN_OFFSETS = {
-    'STEER': 16, 'THROTTLE': 18, 'BRAKE': 20, 'CLUTCH': 22,
-    'STICK-X': 24, 'STICK-Y': 25, 'SLIDER': 26, 'DIAL': 27,
-}
+# HID item prefix is [tag:4][type:2][size:2]; these are the items Fanatec uses.
+LONG_ITEM = 0xfe
+TYPE_MAIN, TYPE_GLOBAL, TYPE_LOCAL = 0, 1, 2
+MAIN_INPUT, MAIN_OUTPUT, MAIN_FEATURE = 0x8, 0x9, 0xb
+G_USAGE_PAGE, G_LOGICAL_MIN, G_LOGICAL_MAX = 0x0, 0x1, 0x2
+G_REPORT_SIZE, G_REPORT_ID, G_REPORT_COUNT = 0x7, 0x8, 0x9
+L_USAGE, L_USAGE_MIN, L_USAGE_MAX = 0x0, 0x1, 0x2
+
+# The documented layout, in one place: it builds the fallback AND checks whatever
+# we parse. docs/report-map.md is the prose copy of this table.
+KNOWN_AXES = [
+    {'name': 'STEER',    'hid': 'X',      'byte': 16, 'bits': 16, 'signed': False},
+    {'name': 'THROTTLE', 'hid': 'Z',      'byte': 18, 'bits': 16, 'signed': False},
+    {'name': 'BRAKE',    'hid': 'Rz',     'byte': 20, 'bits': 16, 'signed': False},
+    {'name': 'CLUTCH',   'hid': 'Y',      'byte': 22, 'bits': 16, 'signed': False},
+    {'name': 'STICK-X',  'hid': 'Rx',     'byte': 24, 'bits': 8,  'signed': True},
+    {'name': 'STICK-Y',  'hid': 'Ry',     'byte': 25, 'bits': 8,  'signed': True},
+    {'name': 'SLIDER',   'hid': 'Slider', 'byte': 26, 'bits': 8,  'signed': False},
+    {'name': 'DIAL',     'hid': 'Dial',   'byte': 27, 'bits': 8,  'signed': True},
+]
+KNOWN_OFFSETS = {ax['name']: ax['byte'] for ax in KNOWN_AXES}
 KNOWN_SIZE = 33
+
+
+def limits(bits, signed):
+    """Logical min/max a field of this width covers."""
+    if signed:
+        return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    return 0, (1 << bits) - 1
+
+
+def _input_fields(gstate, usages, first_bit):
+    """One INPUT main item expanded into per-field dicts, in bit order."""
+    fields = []
+    for n in range(gstate['rcount']):
+        # HID repeats the last usage when the count outruns the declared
+        # usages - that is what bytes 14-15 are.
+        usage = usages[n] if n < len(usages) else (usages[-1] if usages else None)
+        fields.append({
+            'bit': first_bit + n * gstate['rsize'],
+            'size': gstate['rsize'],
+            'page': gstate['usage_page'],
+            'usage': usage,
+            'spare': n >= len(usages),
+            'lmin': gstate['lmin'],
+            'lmax': gstate['lmax'],
+        })
+    return fields
 
 
 def parse_report_descriptor(blob):
@@ -43,7 +86,7 @@ def parse_report_descriptor(blob):
     rather than guessed at.
     """
     i = 0
-    glob = {'usage_page': 0, 'lmin': 0, 'lmax': 0, 'rsize': 0, 'rcount': 0}
+    gstate = {'usage_page': 0, 'lmin': 0, 'lmax': 0, 'rsize': 0, 'rcount': 0}
     usages = []
     usage_min = usage_max = None
     report_id = 0
@@ -53,7 +96,7 @@ def parse_report_descriptor(blob):
     while i < len(blob):
         head = blob[i]
         i += 1
-        if head == 0xfe:             # long item - unused here, skip it
+        if head == LONG_ITEM:        # unused here, skip it
             if i + 1 >= len(blob):
                 break
             i += 2 + blob[i]
@@ -68,54 +111,40 @@ def parse_report_descriptor(blob):
         data = int.from_bytes(raw, 'little') if size else 0
         signed = int.from_bytes(raw, 'little', signed=True) if size else 0
 
-        if itype == 1:                                   # Global
-            if tag == 0x0:
-                glob['usage_page'] = data
-            elif tag == 0x1:
-                glob['lmin'] = signed
-            elif tag == 0x2:
+        if itype == TYPE_GLOBAL:
+            if tag == G_USAGE_PAGE:
+                gstate['usage_page'] = data
+            elif tag == G_LOGICAL_MIN:
+                gstate['lmin'] = signed
+            elif tag == G_LOGICAL_MAX:
                 # signed unless that goes negative - how 0xffff means 65535 here
-                glob['lmax'] = signed if signed >= 0 else data
-            elif tag == 0x7:
-                glob['rsize'] = data
-            elif tag == 0x8:
+                gstate['lmax'] = signed if signed >= 0 else data
+            elif tag == G_REPORT_SIZE:
+                gstate['rsize'] = data
+            elif tag == G_REPORT_ID:
                 report_id = data
-            elif tag == 0x9:
-                glob['rcount'] = data
-        elif itype == 2:                                 # Local
-            if tag == 0x0:
+            elif tag == G_REPORT_COUNT:
+                gstate['rcount'] = data
+        elif itype == TYPE_LOCAL:
+            if tag == L_USAGE:
                 usages.append(data)
-            elif tag == 0x1:
+            elif tag == L_USAGE_MIN:
                 usage_min = data
-            elif tag == 0x2:
+            elif tag == L_USAGE_MAX:
                 usage_max = data
-        elif itype == 0:                                 # Main
-            if tag in (0x8, 0x9, 0xb):                   # Input / Output / Feature
-                count, rsize = glob['rcount'], glob['rsize']
+        elif itype == TYPE_MAIN:
+            if tag in (MAIN_INPUT, MAIN_OUTPUT, MAIN_FEATURE):
                 off = bitpos.get((report_id, tag), 0)
-                if tag == 0x8 and report_id == 0:
-                    us = usages
+                if tag == MAIN_INPUT and report_id == 0:
+                    declared = usages
                     if usage_min is not None and usage_max is not None:
-                        us = list(range(usage_min, usage_max + 1))
-                    for n in range(count):
-                        # HID repeats the last usage when count outruns the
-                        # declared usages - that is what bytes 14-15 are.
-                        usage = us[n] if n < len(us) else (us[-1] if us else None)
-                        fields.append({
-                            'bit': off + n * rsize,
-                            'size': rsize,
-                            'page': glob['usage_page'],
-                            'usage': usage,
-                            'spare': n >= len(us),
-                            'lmin': glob['lmin'],
-                            'lmax': glob['lmax'],
-                        })
-                bitpos[(report_id, tag)] = off + count * rsize
+                        declared = list(range(usage_min, usage_max + 1))
+                    fields += _input_fields(gstate, declared, off)
+                bitpos[(report_id, tag)] = off + gstate['rcount'] * gstate['rsize']
             usages = []
             usage_min = usage_max = None
 
-    size_bits = bitpos.get((0, 0x8), 0)
-    return fields, size_bits
+    return fields, bitpos.get((0, MAIN_INPUT), 0)
 
 
 def build_layout(fields, size_bits):
@@ -153,7 +182,7 @@ def build_layout(fields, size_bits):
                 'signed': f['lmin'] < 0,
                 'lmin': f['lmin'], 'lmax': f['lmax'],
             })
-        elif f['page'] == 0xff00:
+        elif f['page'] == VENDOR_PAGE:
             layout['vendor'].append(f['bit'] // 8)
 
     if btn_bits:
@@ -184,26 +213,13 @@ def build_layout(fields, size_bits):
 
 def fallback_layout(reason):
     """Hardcoded CSL Elite layout, for when the descriptor cannot be read."""
+    axes = []
+    for spec in KNOWN_AXES:
+        lmin, lmax = limits(spec['bits'], spec['signed'])
+        axes.append(dict(spec, lmin=lmin, lmax=lmax))
     return {
         'size': KNOWN_SIZE,
-        'axes': [
-            {'name': 'STEER', 'hid': 'X', 'byte': 16, 'bits': 16,
-             'signed': False, 'lmin': 0, 'lmax': 65535},
-            {'name': 'THROTTLE', 'hid': 'Z', 'byte': 18, 'bits': 16,
-             'signed': False, 'lmin': 0, 'lmax': 65535},
-            {'name': 'BRAKE', 'hid': 'Rz', 'byte': 20, 'bits': 16,
-             'signed': False, 'lmin': 0, 'lmax': 65535},
-            {'name': 'CLUTCH', 'hid': 'Y', 'byte': 22, 'bits': 16,
-             'signed': False, 'lmin': 0, 'lmax': 65535},
-            {'name': 'STICK-X', 'hid': 'Rx', 'byte': 24, 'bits': 8,
-             'signed': True, 'lmin': -128, 'lmax': 127},
-            {'name': 'STICK-Y', 'hid': 'Ry', 'byte': 25, 'bits': 8,
-             'signed': True, 'lmin': -128, 'lmax': 127},
-            {'name': 'SLIDER', 'hid': 'Slider', 'byte': 26, 'bits': 8,
-             'signed': False, 'lmin': 0, 'lmax': 255},
-            {'name': 'DIAL', 'hid': 'Dial', 'byte': 27, 'bits': 8,
-             'signed': True, 'lmin': -128, 'lmax': 127},
-        ],
+        'axes': axes,
         'hat': {'byte': 0, 'shift': 0, 'size': 4, 'lmin': 0, 'lmax': 7},
         'buttons': {'first_bit': 4, 'first_usage': 1, 'count': 108},
         'spare_bits': list(range(112, 128)),
