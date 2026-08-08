@@ -165,7 +165,7 @@ def main():
         for ax in layout['axes']:
             val = pw.axis_value(rep, ax)
             if val is not None:
-                pw.HIST[ax['name']].append((now, val))
+                pw.note_axis(ax['name'], val, now)
         pw.note_buttons(pw.button_mask(rep, spec), spec, now)
         hv = rep[layout['hat']['byte']] >> layout['hat']['shift'] & 0x0f
         if hv != pw.HAT['value']:
@@ -198,6 +198,70 @@ def main():
     ck('button cells rendered', len(snap['buttons']), spec['count'])
     json.dumps(snap)
     print('  ok   snapshot is JSON-serialisable')
+
+    # THE LATCH MUST OUTLIVE THE SPARKLINE WINDOW. HIST is a rolling deque, so
+    # min/max taken from it silently forget a pedal press once HIST_LEN further
+    # reports arrive - the card goes back to "no movement seen since reset" and
+    # a channel that demonstrably worked reads as dead. This is exactly the
+    # false negative that got the brake reported as broken.
+    pw.reset_tracking()
+    pw.install_layout(layout)
+    brake = next(a for a in layout['axes'] if a['name'] == 'BRAKE')
+    rest = pw.axis_value(STEER_PHASE, brake)
+    pressed = bytearray(STEER_PHASE)
+    pressed[brake['byte']], pressed[brake['byte'] + 1] = 0x39, 0x30   # 12345
+    for rep in (bytes(pressed),) + (STEER_PHASE,) * (pw.HIST_LEN + 50):
+        pw.STATE['count'] += 1
+        pw.STATE['report'] = rep
+        for ax in layout['axes']:
+            pw.note_axis(ax['name'], pw.axis_value(rep, ax), now)
+    pw.STATE['lo'] = pw.STATE['hi'] = list(STEER_PHASE)
+    aged = {a['name']: a for a in pw.snapshot()['axes']}['BRAKE']
+    ck('a press that aged out of the sparkline is still latched',
+       aged['min'], 12345)
+    ck('and the channel is NOT called idle', aged['idle'], False)
+    ck('the press is gone from the sparkline, as expected',
+       min(aged['spark']), rest)
+    # a truncated report must not seed a [None, None] latch that crashes the
+    # next sample - note_axis is the single place that decides this
+    pw.note_axis('BRAKE', None, now)
+    pw.note_axis('BRAKE', 500, now)
+    ck('a short report does not poison the latch', pw.SEEN['BRAKE'][0], 500)
+
+    pw.reset_tracking()
+    pw.install_layout(layout)
+    ck('reset clears the latch', pw.SEEN, {})
+
+    # A base that stopped transmitting must never keep advertising the rate it
+    # had when it died: that reads as a live stream, so "my pedal shows
+    # nothing" gets blamed on the pedal instead of on the silence.
+    pw.STATE['rate'] = 138.5
+    pw.STATE['last_report_t'] = time.time() - 30.0
+    stale = pw.snapshot()
+    ck('a dead stream is not called streaming', stale['streaming'], False)
+    ck('a dead stream advertises no rate', stale['rate'], 0.0)
+    ck('a dead stream reports how long it has been silent',
+       stale['silent_for'] >= 29.0, True)
+    ck('30s of silence is frozen', stale['frozen'], True)
+    pw.STATE['last_report_t'] = time.time()
+    ck('a live stream keeps its rate', pw.snapshot()['rate'], 138.5)
+
+    # A few seconds of rest is NORMAL on a send-on-change base. If that tripped
+    # the frozen warning the page would cry wolf constantly and get ignored -
+    # which is exactly how the real warning would be missed.
+    pw.STATE['last_report_t'] = time.time() - (pw.GAP + 1.0)
+    resting = pw.snapshot()
+    ck('a few seconds of rest is not frozen', resting['frozen'], False)
+    ck('but it is honest that no reports are arriving', resting['rate'], 0.0)
+
+    # DROPOUT fires every time the rig sits still, so counting it as a fault
+    # buries the JUMP/RAIL catches the dashboard exists to find.
+    before = pw.STATE['glitches']
+    pw.event('DROPOUT', '-', 'rig sat still')
+    ck('a dropout is not counted as a glitch', pw.STATE['glitches'], before)
+    pw.event('RAIL', 'BRAKE', 'went to MAX')
+    ck('a rail still is', pw.STATE['glitches'], before + 1)
+    pw.STATE['glitches'] = before
 
     # a bit already high in the very first report was never seen going down
     pw.reset_tracking()

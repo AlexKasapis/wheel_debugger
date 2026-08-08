@@ -36,7 +36,13 @@ PORT = 8765
 
 JUMP = 3000        # sample-to-sample delta that counts as a glitch (16-bit ch)
 GAP = 2.0          # seconds without a report that counts as a dropout
-                   # (the base idles around 9 reports/s, so this must be loose)
+                   # The base is SEND-ON-CHANGE: at rest it transmits nothing at
+                   # all, so gaps of any length are normal and a DROPOUT is
+                   # logged for the record but is NOT counted as a fault.
+FROZEN = 20.0      # seconds of silence after which "I pressed it and nothing
+                   # happened" stops being evidence about the control and starts
+                   # being evidence about the stream. Deliberately far above GAP:
+                   # a few seconds of rest must not cry wolf.
 WINDOW = 2.0       # seconds for the rolling jitter stats and the motion panel
 SD_WARN = 200      # rolling stdev above this = electrically noisy channel
                    # (LSB dither measures ~10; the bad throttle measured ~1380)
@@ -84,6 +90,12 @@ LAYOUT = hid_layout.fallback_layout('device not opened yet')
 HIST = {}
 EVENTS = collections.deque(maxlen=400)
 BTN = {}           # button number -> {'on','ever','count','last'}
+# axis name -> [min, max] ever seen since reset. HIST is a ROLLING window kept
+# for the sparkline and the jitter stats, so it cannot answer "did this channel
+# ever move" - a pedal press ages out of it and the card goes back to claiming
+# the channel has never moved. That is the whole point of a latching dashboard,
+# so the latch gets its own storage.
+SEEN = {}
 HAT = {'value': None, 'ever': set()}
 STATE = {
     'dev': None,
@@ -103,9 +115,17 @@ STATE = {
     'spare': None,
     'size_warn': None,
     'btn_init': False,
+    # The base is send-on-change: at rest it transmits NOTHING. A stream that
+    # died therefore looks exactly like a control that produces no data, and
+    # 'rate' freezes at its last value and keeps claiming the stream is live.
+    # Track when the last report actually landed so the page can say so.
+    'last_report_t': None,
 }
 
-FAULT_KINDS = {'JUMP', 'RAIL', 'DROPOUT'}
+# DROPOUT is logged but deliberately NOT a fault: the base is send-on-change, so
+# every rest longer than GAP fires one. Counting them buried the real JUMP/RAIL
+# catches under a glitch total made almost entirely of the rig sitting still.
+FAULT_KINDS = {'JUMP', 'RAIL'}
 
 
 def event(kind, ch, detail):
@@ -124,6 +144,7 @@ def reset_tracking():
     EVENTS.clear()
     STATE['glitches'] = 0
     STATE['lo'] = STATE['hi'] = None
+    SEEN.clear()
     STATE['count'] = 0
     STATE['started'] = time.time()
     for dq in HIST.values():
@@ -142,6 +163,26 @@ def install_layout(layout):
     HIST.clear()
     for ax in layout['axes']:
         HIST[ax['name']] = collections.deque(maxlen=HIST_LEN)
+
+
+def note_axis(name, val, now):
+    """Record one axis sample: rolling history AND the latched min/max.
+
+    One function so the latch can never be updated in one code path and missed
+    in another - the sparkline forgetting a pedal press is survivable, the latch
+    forgetting one is the bug this dashboard exists to not have.
+    """
+    if val is None:                 # report too short for this axis - one place
+        return                      # to handle it, so no caller can seed a
+    HIST[name].append((now, val))   # [None, None] latch and crash the next one
+    seen = SEEN.get(name)
+    if seen is None:
+        SEEN[name] = [val, val]
+    else:
+        if val < seen[0]:
+            seen[0] = val
+        if val > seen[1]:
+            seen[1] = val
 
 
 def axis_value(rep, ax):
@@ -283,6 +324,7 @@ def reader():
                         event('RESUMED', '-',
                               f'stream returned after {int((now-last_t)*1000)}ms')
                     last_t = now
+                    STATE['last_report_t'] = now
                     tick_n += len(reports)
                     if now - tick_t >= 1.0:
                         STATE['rate'] = round(tick_n / (now - tick_t), 1)
@@ -311,7 +353,7 @@ def reader():
                             if val is None:
                                 continue
                             name = ax['name']
-                            HIST[name].append((now, val))
+                            note_axis(name, val, now)
 
                             old = prev.get(name)
                             if (ax['bits'] == 16 and old is not None
@@ -381,11 +423,20 @@ def snapshot():
         warnings = list(LAYOUT['warnings'])
         if STATE['size_warn']:
             warnings.append(STATE['size_warn'])
+        # A frozen 'rate' from a stream that stopped minutes ago is worse than
+        # no number at all - it is what made a silent base read as "the brake
+        # card is broken". Report the silence explicitly and zero the rate.
+        silent = None if STATE['last_report_t'] is None else round(
+            now - STATE['last_report_t'], 1)
+        live = silent is not None and silent <= GAP
         out = {
             'dev': STATE['dev'],
             'connected': STATE['connected'],
             'count': STATE['count'],
-            'rate': STATE['rate'],
+            'rate': STATE['rate'] if live else 0.0,
+            'silent_for': silent,
+            'streaming': live,
+            'frozen': silent is not None and silent > FROZEN,
             'size': STATE['size'],
             'uptime': round(now - STATE['started'], 1),
             'glitches': STATE['glitches'],
@@ -411,6 +462,7 @@ def snapshot():
             pts = list(HIST.get(ax['name'], ()))
             recent = [v for t, v in pts if now - t <= WINDOW]
             vals = [v for _, v in pts]
+            seen = SEEN.get(ax['name'])
             wide = ax['bits'] == 16
             ch = {
                 'name': ax['name'],
@@ -422,9 +474,9 @@ def snapshot():
                 'value': vals[-1] if vals else None,
                 'volts': (round(vals[-1] / 65535 * 3.3, 3)
                           if vals and ax['name'] in VOLT_CHANNELS else None),
-                'min': min(vals) if vals else None,
-                'max': max(vals) if vals else None,
-                'span': (max(vals) - min(vals)) if vals else 0,
+                'min': seen[0] if seen else None,
+                'max': seen[1] if seen else None,
+                'span': (seen[1] - seen[0]) if seen else 0,
                 'jitter_sd': round(statistics.pstdev(recent), 1) if len(recent) > 1 else 0.0,
                 'jitter_rev': reversals(recent) if len(recent) > 1 else 0,
                 'n_recent': len(recent),
@@ -436,7 +488,8 @@ def snapshot():
             ch['rev_per100'] = (round(100.0 * ch['jitter_rev'] / len(recent), 1)
                                 if len(recent) > 1 else 0.0)
             ch['warn'] = wide and ch['jitter_sd'] > SD_WARN
-            ch['idle'] = not vals or ch['span'] == 0
+            # latched, not windowed: "never moved since you pressed reset"
+            ch['idle'] = seen is None or ch['span'] == 0
             out['axes'].append(ch)
 
             # Motion attribution: what actually responded in the last WINDOW.
@@ -699,6 +752,16 @@ async function tick() {
   catch (e) { return; }
 
   const b = document.getElementById('banner');
+  // The base is send-on-change, so silence at rest is NORMAL and must not cry
+  // wolf. Silence is a clause appended to whatever the headline is, never a
+  // replacement for it - only a long freeze invalidates a test you just ran.
+  const quiet = d.frozen
+    ? '   |   NO REPORTS FOR ' + d.silent_for + 's - THIS PAGE IS FROZEN, not '
+      + 'idle. The base transmits only when something changes, so a control '
+      + 'that reads nothing right now proves NOTHING about that control. '
+      + 'Turn the wheel to confirm the stream is alive, then retry it.'
+    : (d.streaming ? '' : '   |   quiet ' + d.silent_for + 's (normal at rest)');
+
   if (!d.connected) {
     b.className = 'bad';
     b.textContent = 'DEVICE NOT CONNECTED - ' + d.dev;
@@ -709,13 +772,20 @@ async function tick() {
                   + '- it sends nothing at all when it is off. '
                   + '(' + d.uptime + 's waiting)';
   } else if (d.glitches > 0) {
+    // Latched glitches stay the headline even while the base is silent - that
+    // is the whole point of latching, and "come back later and read the page"
+    // is by definition a moment when nothing is moving.
     b.className = 'bad';
     b.textContent = d.glitches + ' GLITCH EVENT(S) CAUGHT - see log below   |   '
-                  + d.rate + ' rep/s, ' + d.count + ' total, ' + d.uptime + 's';
+                  + d.rate + ' rep/s, ' + d.count + ' total, ' + d.uptime + 's'
+                  + quiet;
+  } else if (d.frozen) {
+    b.className = 'idle';
+    b.textContent = 'no glitches caught yet' + quiet;
   } else {
     b.className = '';
     b.textContent = 'clean - no glitches   |   ' + d.rate + ' rep/s, '
-                  + d.count + ' reports, ' + d.uptime + 's up';
+                  + d.count + ' reports, ' + d.uptime + 's up' + quiet;
   }
 
   const w = document.getElementById('warn');

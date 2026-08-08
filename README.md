@@ -60,7 +60,8 @@ rather than from guessed byte offsets:
 - **Event log**, latched until you press reset:
   - `JUMP` — sample-to-sample delta over 3000
   - `RAIL` — channel *entered* 0 or 65535 (resting at a rail does not log)
-  - `DROPOUT` — no HID report for 2 s
+  - `DROPOUT` — no HID report for 2 s. Logged but **not counted as a fault**:
+    the base is send-on-change, so sitting still fires one every time
   - `BTN-NEW` / `BTN` / `HAT` — button and hat activity
 - Byte grid of the whole 33-byte report with per-byte min/max, each byte labelled
   with the field the descriptor says lives there, plus a warning if a byte moves
@@ -163,8 +164,14 @@ pass `REAL_USER=<name>` explicitly.
   `/dev/input/by-id/usb-Fanatec_*-hidraw`, never a hardcoded `hidrawN`, and run
   `setup/enable-rawhid.sh` (`hidraw_pid=0`) before raw inspection.
 - **The base re-enumerates on replug** (`.0107` → `.0109`), so device paths move.
-- **The base idles at ~9 reports/s** with nothing moving. Any dropout threshold
-  tighter than ~2 s false-fires continuously.
+- **The base is send-on-change: at rest it transmits nothing at all.** This is
+  the single most misleading thing about the rig. "I pressed it and the page did
+  not move" has two indistinguishable causes — the control produces no data, or
+  the base is not transmitting. **Every pedal test needs a positive control in
+  the same window**: turn the wheel, press the pedal, turn the wheel again. If
+  both steering legs report, the pedal window is bracketed and a null result is
+  real. (An earlier note here claimed ~9 reports/s at idle; that was the faulty
+  throttle dithering, not an idle heartbeat.)
 - **`EVIOCRMFF` takes the effect id by value**, not a pointer. Passing a packed
   struct gives `Errno 22`.
 - **Do not `pkill -f <script>`** from a shell whose own command line contains

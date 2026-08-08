@@ -1,5 +1,115 @@
 # Fanatec CSL Elite — session notes
 
+## *** BRAKE HAS GONE SILENT — new fault, captured with positive control ***
+User reported "the brake does not display anything in the web app". It does not,
+and the channel really is producing nothing — but the first look at it was
+**uninterpretable**, for a reason worth keeping.
+
+**The base is send-on-change.** At rest it transmits NOTHING — not the ~9/s
+recorded further down this file. So "I pressed X and the page did not move" has
+two indistinguishable causes: X produces no data, or the base is not
+transmitting at all. Every brake test must carry a positive control in the same
+window.
+
+FIRST LOOK (worthless, kept as the cautionary example): dashboard showed
+BRAKE flat at 0 and the banner read `138.5 rep/s, 699 total`. But `count` was
+frozen at 699 while `uptime` climbed 131 → 185 s, and a direct read of
+`/dev/hidraw8` blocked for 6 s. The base had sent nothing for ~160 s. Nothing
+could have moved. (`rate` freezes at its last value when the stream dies — now
+fixed, see below.)
+
+GUIDED CAPTURE WITH POSITIVE CONTROL (raw hidraw, every byte watched):
+
+    47.7 - 54.4 s   STEER    32889 -> 21465 -> 34074      moved, stream alive
+    56.4 - 59.8 s   THROTTLE 65535 -> 63847 -> 65502      moved, 3% of range
+    then            BRAKE pressed fully, 3x, ~40 s        ZERO REPORTS EMITTED
+
+Steering and throttle prove the base was awake and streaming minutes into the
+same capture. The brake presses produced **not one report** — the base did not
+even consider anything to have changed.
+
+* BRAKE bytes 20-21: `lo=0 hi=0` across 699 reports in one session and across
+  the whole guided capture in another. Rest value 0 is the brake's **correct**
+  resting value (a load cell at zero force; the original good capture ran
+  0 -> 65535), so **0 is not by itself a disconnection signature.**
+* No OTHER byte in the 33-byte report moved during the brake presses either.
+  The brake's data is absent from the entire report, not merely mislabelled or
+  landing on a different channel.
+* Clutch pedal was physically OUT during this capture and was not pressed, so
+  CLUTCH (65535, flat) says nothing here.
+* THROTTLE moved 63566 -> 65535 on a FULL press = **3.0% of range**, matching
+  the bad 3.4% run rather than the 16.3% one. The intermittent throttle fault is
+  still present and currently at its worst.
+
+STATUS: the brake was measured HEALTHY (full 0-65535, 11 reversals in 417
+samples) before the pedals were disassembled. It is now silent. The pedals have
+since been apart — clutch pot removed, throttle/clutch connectors swapped — so a
+disturbed brake connection is the leading hypothesis over a spontaneous failure.
+
+### RESEATING THE BRAKE PLUG BROUGHT THE CHANNEL BACK
+Bracketed capture, steer -> brake -> steer both sides of a plug reseat:
+
+    63.4 - 67.3 s   STEER  32935 -> 54931          stream alive
+    67.3 - 78.0 s   BRAKE pressed          NOTHING  <-- bracketed null
+    78.0 - 81.2 s   STEER  54916 -> 32646          stream still alive
+    -------- brake plug reseated --------
+    96.3 - 100.1 s  BRAKE  0 -> 65535 -> 0        ** CHANNEL ALIVE **
+   105.4 - 107.1 s  STEER  32692 -> 54764
+   107.1 - 113.1 s  (no brake data in this window)
+   113.1 - 115.8 s  STEER  55341 -> 32828
+
+The pre-reseat null is now **bracketed on both sides** by steering that
+reported — the base was demonstrably streaming before and after, so the brake
+producing nothing was real and not a silent base. After the reseat the channel
+delivered a full 0 -> 65535 -> 0 press. **The fault was the connection, not the
+load cell and not the board.**
+
+CAVEAT — NOT YET RELIABLE. Only ONE brake response was captured. The later
+window at 107.1-113.1 s, bracketed by steering on both sides, contains no brake
+data. Either the brake was simply not pressed then, or it dropped out again.
+Unresolved; retest with several bracketed presses before calling this fixed.
+A connector that works after reseating and then quits is the same signature the
+throttle jack already has.
+
+Signal quality on the one good press: held at 64054-65535 (97.7-100% of scale)
+for ~3.5 s, released cleanly to 0 with one 1128 bounce. Sampling was thinned to
+4 Hz, so the ramp shape was NOT captured — rerun at full resolution before
+judging smoothness.
+
+STILL OPEN (each needs a positive control in the same window):
+ 1. Several bracketed brake presses — is the reseat durable or intermittent?
+ 2. If it quits again: watch byte 20 while unplugging/replugging. If the value
+    moves at all on unplug, the channel is alive and reading the pedal.
+ 3. Substitution: brake pedal -> throttle-IN jack (a known-good channel — the
+    clutch pedal read cleanly through it). Registers on byte 18 => brake pedal
+    and cable are fine, fault is the brake-IN channel.
+
+### TOOLING BUGS FOUND BY THIS REPORT — all three faked a dead pedal
+1. **THE LATCH DID NOT LATCH.** Axis `min`/`max`/`span`/`idle` were computed
+   from `HIST`, a rolling `deque(maxlen=900)` kept for the sparkline. A pedal
+   press therefore **aged out after 900 further reports** and the card went back
+   to "no movement seen since reset (rests at 0)" — a channel that had
+   demonstrably worked reading as dead. This is the headline bug: the dashboard's
+   entire premise is that an intermittent fault stays on screen. Latched min/max
+   now lives in `SEEN`, updated via `note_axis()` — one function, so a code path
+   cannot fill the history and miss the latch. Only `/reset` clears it.
+2. **A DEAD STREAM ADVERTISED ITS OLD RATE.** The "no reports" banner only fired
+   when `count == 0`, so a stream that died *after* delivering reports kept
+   showing `138.5 rep/s` while frozen for minutes. `snapshot()` now exposes
+   `silent_for` / `streaming` / `frozen`; `rate` reads 0 when silent; the banner
+   appends "NO REPORTS FOR Ns - THIS PAGE IS FROZEN, not idle" past `FROZEN`
+   (20 s, deliberately far above `GAP` so normal rest does not cry wolf).
+   Silence is a *clause*, never a branch — latched glitches stay the headline,
+   since coming back later to read the page is by definition a quiet moment.
+3. **DROPOUT WAS COUNTED AS A FAULT.** With a send-on-change base every rest
+   longer than `GAP` fires one, so the glitch total was mostly the rig sitting
+   still, burying real JUMP/RAIL catches. DROPOUT is still logged, no longer
+   counted (`FAULT_KINDS`).
+
+All three are covered by `tools/selftest-decode.py`, including a regression test
+that presses the brake, pushes `HIST_LEN + 50` further reports through, and
+asserts the press is still latched after it has left the sparkline.
+
 ## CURRENT MACHINE STATE (as of 2026-08-08)
 The box is left in the **modified HID state for diagnostics**:
 - `/etc/modprobe.d/hid-fanatec.conf` exists and contains `hidraw_pid=0`,
@@ -368,8 +478,12 @@ pedal travel it has not run past the other. Set by eye, verified live. Nothing
 was ruined. ALWAYS mark pot body->shaft with a marker + photo before removing.
 
 ## OBSERVED IDLE BEHAVIOUR (matters for tooling thresholds)
-- Base idles at ~9 reports/s with nothing moving => a dropout threshold of
-  250 ms false-fires constantly. Use >= 2 s.
+- ~~Base idles at ~9 reports/s with nothing moving => a dropout threshold of
+  250 ms false-fires constantly. Use >= 2 s.~~ **SUPERSEDED — see the
+  send-on-change section at the top.** The base transmits NOTHING at rest; the
+  ~9/s was the faulty throttle dithering, not an idle heartbeat. No dropout
+  threshold is safe, which is why DROPOUT is now logged but not counted as a
+  fault.
 - With pedals disassembled/unplugged: THR-IN rests at 0, BRK-IN rests at 65535,
   STEER centred 32768 with ~±30 LSB dither (stdev ~10).
   => stdev is the good health metric at rest: LSB dither ~10 vs bad throttle
