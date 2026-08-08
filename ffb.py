@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
 """Bounded force-feedback test that measures its own result.
 
-Uploads a CONSTANT force effect at a gentle magnitude, plays it one way, then
-the other, then erases it. Nothing runs open-ended.
+Uploads a CONSTANT effect at a gentle magnitude, plays it one way then the other,
+then erases it. Nothing runs open-ended. The fd is O_RDWR, so the same descriptor
+that uploads the effect reads ABS_X back while the motor pushes - torque is
+measured every run, not inferred.
 
-The effect plumbing is the proven code from the old tools/ffb-test.py, kept
-byte for byte - including the two things that cost real time to discover:
-EVIOCRMFF takes the effect id BY VALUE rather than as a pointer, and struct
-ff_effect is 48 bytes on x86_64 because the union is 8-byte aligned.
-
-What is new is the measurement. The old script pushed the wheel and told you
-nothing; the numbers in docs/FINDINGS.md ("left 12776 -> 33071, delta 20295")
-came from a separate capture that was never committed, so "FFB works" was a
-claim you had to take on trust and could not re-run. The fd is already O_RDWR,
-so the same descriptor that uploads the effect reads ABS_X back while the motor
-pushes. Torque is then measured, not inferred, every single run.
-
-Measurement is deliberately evdev rather than the dashboard's own STEER channel:
-the event node exists whenever the driver is bound, but the hidraw node only
-points at the real base while hidraw_pid=0 is set. Measuring through hidraw
-would make this silently useless in the machine's normal state.
-
-Standard library only.
+Measurement goes through evdev rather than the dashboard's own STEER channel
+because the event node exists whenever the driver is bound, while hidraw points at
+the real base only while hidraw_pid=0 is set.
 """
 import fcntl
 import os
@@ -44,9 +31,8 @@ FF_CONSTANT = 0x52
 DIR_LEFT = 0x4000
 DIR_RIGHT = 0xC000
 
-# struct ff_effect is 48 bytes on x86_64 (the union is 8-byte aligned -> it
-# starts at offset 16). struct input_event is 24: timeval(16) + type + code +
-# value.
+# struct ff_effect is 48 bytes on x86_64: the union is 8-byte aligned, so it
+# starts at offset 16. struct input_event is 24: timeval(16) + type + code + value.
 EVIOCSFF = 0x40000000 | (48 << 16) | (ord('E') << 8) | 0x80
 EVIOCRMFF = 0x40000000 | (4 << 16) | (ord('E') << 8) | 0x81
 EVENT_SIZE = 24
@@ -67,7 +53,7 @@ _STATE = {
 
 
 def status():
-    """Snapshot for the dashboard. Cheap - no I/O, safe at the /data poll rate."""
+    """Snapshot for the dashboard. No I/O, so safe at the /data poll rate."""
     with _LOCK:
         out = dict(_STATE)
         out['result'] = {k: dict(v) for k, v in _STATE['result'].items()}
@@ -132,8 +118,7 @@ def _push(fd, eid, direction, seconds):
         _play(fd, eid, 0)
 
     if not vals:
-        # An honest null: no samples means we could not measure, which is NOT
-        # the same as measuring zero torque. Say which one it is.
+        # No samples means we could not measure, not that torque was zero.
         return {'samples': 0, 'first': None, 'last': None, 'min': None,
                 'max': None, 'delta': 0, 'span': 0, 'moved': False,
                 'note': 'no ABS_X samples - could not measure movement'}
@@ -177,7 +162,7 @@ def _run(path):
             fcntl.ioctl(fd, EVIOCRMFF, eid)   # takes the id BY VALUE, not a pointer
         _set(phase='aborted' if _ABORT.is_set() else 'done')
     except OSError as exc:
-        # Best effort: never leave an effect loaded on the device.
+        # Best effort - never leave an effect loaded on the device.
         try:
             if fd is not None and eid >= 0:
                 _play(fd, eid, 0)
@@ -196,9 +181,8 @@ def _run(path):
 
 def start():
     """Kick off one test. Returns (ok, message). Single-flight."""
-    # Single flight is checked FIRST, before the device is even looked at: if a
-    # test is running that is the answer regardless of what the node says, and
-    # a double-tap must never stack two uploads onto the same effect slot.
+    # Checked before the device is looked at: a double-tap must never stack two
+    # uploads onto the same effect slot.
     with _LOCK:
         if _STATE['running']:
             return False, 'a test is already running'

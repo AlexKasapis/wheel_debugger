@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """Self-test for the dashboard - runs with the base powered OFF.
 
-Replays the real reports archived in data/raw-pedal-map.log through
-hid_layout.py, sysstate.py and pedal-web.py's decoders and asserts the result.
-This exists because every "the dashboard does not show my clutch / my buttons"
-bug in this project came from an unverified byte offset, and the base only
-streams while someone is physically at the rig - so without this, changing a
-decoder means going and sitting in the seat to find out what broke.
-
-If /dev/hidraw for the base is readable the layout comes from the device's own
-report descriptor; otherwise the hardcoded CSL Elite fallback is tested.
+Replays the reports archived in data/raw-pedal-map.log through hid_layout.py,
+sysstate.py and pedal-web.py's decoders and asserts the result, so a decoder can
+be changed without sitting at the rig to find out what broke. The layout comes
+from the device's descriptor if hidraw is readable, else from the fallback.
 
 Nothing here opens a device for I/O and nothing here can move the wheel.
 
@@ -58,11 +53,8 @@ CAPTURE = os.path.join(ROOT, 'data', 'raw-pedal-map.log')
 def load_phases(path):
     """{phase name: first raw report} from an archived labelled capture.
 
-    Read at runtime rather than pasted in as hex. These bytes used to be copied
-    out of this log by hand, which meant the log and the fixture could drift
-    apart silently and the test would keep asserting bytes nothing produces any
-    more. If the evidence file goes missing the test now fails loudly, which is
-    the correct outcome: the archived capture IS the fixture.
+    Read at runtime, not pasted in as hex, so the log and the fixture cannot
+    drift apart: the archived capture IS the fixture.
     """
     phases, name = {}, None
     with open(path) as fh:
@@ -128,7 +120,7 @@ def main():
 
     print('\n[4] vendor block - independent confirmation of the offsets')
     info = pw.decode_vendor(STEER_PHASE)
-    # 693 is what the base shows on its own display at boot, and its bcdDevice
+    # 693 is what the base shows on its own display at boot, and its bcdDevice.
     ck('fw_version', info.get('fw_version'), 693)
     ck('wheel_id', info.get('wheel_id'), 0x20)
     variant = bytearray(STEER_PHASE)
@@ -150,8 +142,7 @@ def main():
     ck('button 5 (GEAR UP) at byte 1 bit 0', (b5 // 8, b5 % 8), (1, 0))
     ck('button 108 at byte 13 bit 7',
        ((spec['first_bit'] + 107) // 8, (spec['first_bit'] + 107) % 8), (13, 7))
-    # byte 15 rests at a constant 0x16 on this base; it is inside the declared
-    # button block but is not a button, so it must never light a cell up
+    # byte 15 rests at a constant 0x16 inside the declared button block.
     ck('no phantom buttons from byte 15',
        pw.button_mask(STEER_PHASE, spec), 0)
     ck('spare bits are bytes 14-15',
@@ -222,11 +213,8 @@ def main():
     json.dumps(snap)
     print('  ok   snapshot is JSON-serialisable')
 
-    # THE LATCH MUST OUTLIVE THE SPARKLINE WINDOW. HIST is a rolling deque, so
-    # min/max taken from it silently forget a pedal press once HIST_LEN further
-    # reports arrive - the card goes back to "no movement seen since reset" and
-    # a channel that demonstrably worked reads as dead. This is exactly the
-    # false negative that got the brake reported as broken.
+    # The latch must outlive the rolling sparkline window, or a channel that
+    # demonstrably worked reads as dead once HIST_LEN further reports arrive.
     pw.reset_tracking()
     pw.install_layout(layout)
     brake = next(a for a in layout['axes'] if a['name'] == 'BRAKE')
@@ -245,8 +233,7 @@ def main():
     ck('and the channel is NOT called idle', aged['idle'], False)
     ck('the press is gone from the sparkline, as expected',
        min(aged['spark']), rest)
-    # a truncated report must not seed a [None, None] latch that crashes the
-    # next sample - note_axis is the single place that decides this
+    # a truncated report must not seed a [None, None] latch
     pw.note_axis('BRAKE', None, now)
     pw.note_axis('BRAKE', 500, now)
     ck('a short report does not poison the latch', pw.SEEN['BRAKE'][0], 500)
@@ -255,9 +242,8 @@ def main():
     pw.install_layout(layout)
     ck('reset clears the latch', pw.SEEN, {})
 
-    # A base that stopped transmitting must never keep advertising the rate it
-    # had when it died: that reads as a live stream, so "my pedal shows
-    # nothing" gets blamed on the pedal instead of on the silence.
+    # A stream that died must not keep advertising its old rate, or the silence
+    # gets blamed on the pedal.
     pw.STATE['rate'] = 138.5
     pw.STATE['last_report_t'] = time.time() - 30.0
     stale = pw.snapshot()
@@ -269,16 +255,14 @@ def main():
     pw.STATE['last_report_t'] = time.time()
     ck('a live stream keeps its rate', pw.snapshot()['rate'], 138.5)
 
-    # A few seconds of rest is NORMAL on a send-on-change base. If that tripped
-    # the frozen warning the page would cry wolf constantly and get ignored -
-    # which is exactly how the real warning would be missed.
+    # A few seconds of rest is normal here; crying wolf would get the real
+    # warning ignored.
     pw.STATE['last_report_t'] = time.time() - (pw.GAP + 1.0)
     resting = pw.snapshot()
     ck('a few seconds of rest is not frozen', resting['frozen'], False)
     ck('but it is honest that no reports are arriving', resting['rate'], 0.0)
 
-    # DROPOUT fires every time the rig sits still, so counting it as a fault
-    # buries the JUMP/RAIL catches the dashboard exists to find.
+    # DROPOUT fires whenever the rig sits still, so it must not bury JUMP/RAIL.
     before = pw.STATE['glitches']
     pw.event('DROPOUT', '-', 'rig sat still')
     ck('a dropout is not counted as a glitch', pw.STATE['glitches'], before)
@@ -306,9 +290,8 @@ def main():
     ck('the vendor block is claimed',
        {labels[b] for b in layout['vendor']}, {'vendor'})
 
-    # If a byte starts moving that the descriptor does not claim, something new
-    # is reporting and the page has to say so - it is how an undocumented field
-    # would ever be noticed at all.
+    # A byte moving that the descriptor does not claim is how an undocumented
+    # field would ever get noticed.
     orphan = layout['vendor'][-1]
     pw.reset_tracking()
     pw.install_layout(dict(layout, vendor=layout['vendor'][:-1]))
@@ -321,8 +304,7 @@ def main():
     pw.reset_tracking()
     pw.install_layout(layout)
 
-    # Reversal count is what separated the healthy brake (11 in 417 samples)
-    # from the faulty throttle (248 in 401 while held motionless).
+    # Reversal count separated the healthy brake from the faulty throttle.
     ck('a clean sweep never reverses', pw.reversals([0, 10, 20, 30]), 0)
     ck('one direction change is one reversal', pw.reversals([0, 10, 5]), 1)
     ck('resting dither reverses on nearly every sample',
@@ -339,14 +321,13 @@ def main():
               - {'ok', 'warn', 'bad', 'unknown'}), [])
     ck('overall is the worst check present', sysstate.RANK[st['overall']],
        max(sysstate.RANK[c['status']] for c in st['checks']))
-    # A failing check that does not tell you what to do about it is just an
-    # alarm, which is the thing this whole panel exists to stop being.
+    # A failing check with no fix is just an alarm.
     ck('every failing check offers a fix or a reason',
        all(c['fix'] or c['why'] for c in st['checks'] if c['status'] == 'bad'),
        True)
     ck('the summary is JSON-serialisable', bool(json.dumps(st)), True)
-    # The bitmask this base actually reports, per docs/FINDINGS.md.
-    ck('the FF bitmask decodes to the 12 effects FINDINGS recorded',
+    # The bitmask this base actually reports, per docs/driver.md.
+    ck('the FF bitmask decodes to the 12 effects docs/driver.md records',
        sysstate.decode_ff('1f7f0000 0'),
        ['RUMBLE', 'PERIODIC', 'CONSTANT', 'SPRING', 'FRICTION', 'DAMPER',
         'INERTIA', 'SQUARE', 'TRIANGLE', 'SINE', 'SAW_UP', 'SAW_DOWN'])
@@ -364,8 +345,7 @@ def main():
     ck('aborting with nothing running is a no-op', ffb.abort()[0], False)
     ck('status is JSON-serialisable', bool(json.dumps(fst)), True)
 
-    # Single flight, checked BEFORE the device is looked at: a double-tap on a
-    # phone must not stack two effect uploads onto the same slot.
+    # Single flight, checked before the device is looked at.
     with ffb._LOCK:
         ffb._STATE['running'] = True
     try:

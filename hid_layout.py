@@ -1,37 +1,12 @@
 #!/usr/bin/env python3
 """Derive the base's raw HID input-report layout from its report descriptor.
 
-Every "the dashboard does not show my clutch / my paddles / my buttons" bug in
-this project came from hardcoding byte offsets that were discovered by wiggling
-things. The descriptor already states the layout exactly, so parse it instead
-and only fall back to hardcoded offsets when it cannot be read.
-
-Verified against the CSL Elite base (0eb7:0e03), which yields:
-
-      bit   0 (byte  0, bits 0-3)   Hat switch, 0-7, 8 = centre
-      bit   4 (bytes 0-13)          108 buttons, LSB-first
-      bits 112-127 (bytes 14-15)    16 further declared button bits; on this
-                                    base they are NOT buttons - byte 15 sits at
-                                    a constant 0x16 - so they are reported raw
-      byte 16  u16 LE  X       STEER
-      byte 18  u16 LE  Z       THROTTLE  (throttle-IN jack)
-      byte 20  u16 LE  Rz      BRAKE     (brake-IN jack, load cell)
-      byte 22  u16 LE  Y       CLUTCH    (clutch-IN jack)
-      byte 24  s8      Rx      rim ministick X
-      byte 25  s8      Ry      rim ministick Y
-      byte 26  u8      Slider
-      byte 27  s8      Dial
-      bytes 28-32       vendor-defined (fw version, wheel id, pedal presence)
-
-Standard library only.
+The layout it yields is documented in docs/report-map.md.
 """
 import glob
 import os
 
-# The base re-enumerates on replug (.0107 -> .0109), so a hardcoded hidrawN or
-# eventN goes stale without warning. Everything resolves through the udev by-id
-# symlinks instead, and it resolves through THIS module so there is exactly one
-# place that knows the names.
+# The base re-enumerates on replug, so hardcoded node names go stale silently.
 BY_ID = '/dev/input/by-id'
 NODE_GLOBS = {
     'hidraw': 'usb-Fanatec_*-hidraw',
@@ -53,9 +28,7 @@ AXIS_USAGES = {
 HAT_USAGE = (0x01, 0x39)
 BUTTON_PAGE = 0x09
 
-# what the CSL Elite is known to produce - used as the fallback layout and as a
-# sanity check on whatever we parse, so a surprise shows up as a warning rather
-# than as a silently mislabelled channel
+# The fallback layout, and a sanity check on whatever we parse.
 KNOWN_OFFSETS = {
     'STEER': 16, 'THROTTLE': 18, 'BRAKE': 20, 'CLUTCH': 22,
     'STICK-X': 24, 'STICK-Y': 25, 'SLIDER': 26, 'DIAL': 27,
@@ -64,9 +37,9 @@ KNOWN_SIZE = 33
 
 
 def parse_report_descriptor(blob):
-    """Return the INPUT fields of report id 0 as a flat list, in bit order.
+    """INPUT fields of report id 0, flat and in bit order.
 
-    Only the items Fanatec actually uses are handled; anything else is skipped
+    Only the items Fanatec actually uses are handled; the rest are skipped
     rather than guessed at.
     """
     i = 0
@@ -80,7 +53,7 @@ def parse_report_descriptor(blob):
     while i < len(blob):
         head = blob[i]
         i += 1
-        if head == 0xfe:             # long item - not used by Fanatec, skip it
+        if head == 0xfe:             # long item - unused here, skip it
             if i + 1 >= len(blob):
                 break
             i += 2 + blob[i]
@@ -101,8 +74,7 @@ def parse_report_descriptor(blob):
             elif tag == 0x1:
                 glob['lmin'] = signed
             elif tag == 0x2:
-                # logical max is signed unless min is 0 and the value would go
-                # negative - that is how 0xffff means 65535 here
+                # signed unless that goes negative - how 0xffff means 65535 here
                 glob['lmax'] = signed if signed >= 0 else data
             elif tag == 0x7:
                 glob['rsize'] = data
@@ -127,7 +99,7 @@ def parse_report_descriptor(blob):
                         us = list(range(usage_min, usage_max + 1))
                     for n in range(count):
                         # HID repeats the last usage when count outruns the
-                        # declared usages - that is exactly what bytes 14-15 are
+                        # declared usages - that is what bytes 14-15 are.
                         usage = us[n] if n < len(us) else (us[-1] if us else None)
                         fields.append({
                             'bit': off + n * rsize,
@@ -194,7 +166,7 @@ def build_layout(fields, size_bits):
         }
         layout['spare_bits'] = [f['bit'] for f in spare]
 
-    # A dashboard that is confidently wrong is worse than one that says so.
+    # Warn rather than mislabel a channel: confidently wrong is the worst case.
     for name, want in KNOWN_OFFSETS.items():
         got = next((a['byte'] for a in layout['axes'] if a['name'] == name), None)
         if got is None:
@@ -202,7 +174,7 @@ def build_layout(fields, size_bits):
         elif got != want:
             layout['warnings'].append(
                 f'{name} is at byte {got}, not the documented {want} - '
-                'docs/FINDINGS.md offsets are stale')
+                'docs/report-map.md offsets are stale')
     if layout['size'] != KNOWN_SIZE:
         layout['warnings'].append(
             f'report is {layout["size"]} bytes, expected {KNOWN_SIZE}')

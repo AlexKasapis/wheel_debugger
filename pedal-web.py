@@ -1,36 +1,12 @@
 #!/usr/bin/env python3
 """Local web dashboard for the Fanatec base's raw HID stream.
 
-A background thread reads the RAW HID reports at full rate and detects
-dropouts, rail-pinning and value jumps, then LATCHES them - so an
-intermittent fault lasting 20ms still shows on screen minutes later.
-The page polls at 10Hz; the detection runs at full report rate.
+A background thread reads raw HID at full report rate, detects dropouts,
+rail-pinning and value jumps, and LATCHES them, so an intermittent fault lasting
+20 ms still shows on screen minutes later. The page polls at 10 Hz. It also hosts
+the system checks (sysstate.py) and the force-feedback test (ffb.py).
 
-Everything the base sends is decoded: 4 analog axes (steer / throttle / brake /
-clutch), the rim ministick, slider and dial, the hat switch, all 108 button
-bits and the vendor block (firmware version, wheel id, pedal presence). The
-byte offsets are not guessed - they are derived from the device's own HID report
-descriptor at startup (see hid_layout.py), and any mismatch against the
-documented layout is shown as a warning instead of silently mislabelling a
-channel.
-
-It also owns the two things that used to be terminal scripts:
-
-  * the SYSTEM CHECKS (sysstate.py) - whether the driver is bound, whether
-    hidraw points at the real base or the driver's virtual PID device, whether
-    the box is still in diagnostic HID mode, and what force feedback the device
-    advertises. A failing check names the command that fixes it. Nothing here
-    is ever executed: root work stays with the human.
-  * the FORCE FEEDBACK TEST (ffb.py), bounded to 25% for 1.5s per direction and
-    measured through ABS_X so torque is a number, not a claim.
-
-Run:   python3 pedal-web.py
-Then:  open the URL it prints (works from your phone on the same network).
-
-NOTE the FFB routes physically move the wheel and this server has no auth, so
-anyone on the LAN can trigger them. Start with --no-ffb to leave them out.
-
-Standard library only, no dependencies.
+Run:  python3 pedal-web.py   (--no-ffb leaves out the routes that move the wheel)
 """
 import collections
 import http.server
@@ -51,31 +27,22 @@ PORT = 8765
 FFB_ENABLED = True   # overridden by --no-ffb in __main__
 
 JUMP = 3000        # sample-to-sample delta that counts as a glitch (16-bit ch)
-GAP = 2.0          # seconds without a report that counts as a dropout
-                   # The base is SEND-ON-CHANGE: at rest it transmits nothing at
-                   # all, so gaps of any length are normal and a DROPOUT is
-                   # logged for the record but is NOT counted as a fault.
-FROZEN = 20.0      # seconds of silence after which "I pressed it and nothing
-                   # happened" stops being evidence about the control and starts
-                   # being evidence about the stream. Deliberately far above GAP:
-                   # a few seconds of rest must not cry wolf.
+GAP = 2.0          # seconds of silence that logs a DROPOUT (never a fault: the
+                   # base is send-on-change, so rest is silent by design)
+FROZEN = 20.0      # seconds of silence past which the page says it is frozen,
+                   # not idle. Far above GAP so brief rest cannot cry wolf.
 WINDOW = 2.0       # seconds for the rolling jitter stats and the motion panel
-SD_WARN = 200      # rolling stdev above this = electrically noisy channel
-                   # (LSB dither measures ~10; the bad throttle measured ~1380)
-MOTION_MIN16 = 200 # peak-to-peak below this in WINDOW is dither, not input.
-                   # Resting dither measures ~+-30 LSB (stdev ~10), so this
-                   # clears it comfortably while any real input is thousands.
+SD_WARN = 200      # rolling stdev above this = noisy (dither ~10, bad thr ~1380)
+MOTION_MIN16 = 200 # peak-to-peak below this in WINDOW is dither (~+-30 LSB)
 MOTION_MIN8 = 2
 HIST_LEN = 900
 SPARK = 180
 
-# pedal channels are pot dividers off the 3.3V sensor supply, so a voltage
-# readout is meaningful there; STEER is an encoder, so it is not
+# Pot dividers off the 3.3V sensor supply; STEER is an encoder, so no volts.
 VOLT_CHANNELS = {'THROTTLE', 'BRAKE', 'CLUTCH'}
 
-# Hardware button number -> what it is on a Fanatec rim. Taken from the
-# ftec_keymap comments in hid-fanatec 0.2.3 (hid-ftec.c), which document the
-# base's button numbering regardless of how the driver maps it to evdev codes.
+# Hardware button number -> rim function, per the ftec_keymap comments in
+# hid-fanatec 0.2.3 (hid-ftec.c).
 BTN_FN = {
     1: 'Square', 2: 'Cross', 3: 'Circle', 4: 'Triangle',
     5: 'GEAR UP  (right shift paddle)', 6: 'GEAR DOWN  (left shift paddle)',
@@ -106,11 +73,9 @@ LAYOUT = hid_layout.fallback_layout('device not opened yet')
 HIST = {}
 EVENTS = collections.deque(maxlen=400)
 BTN = {}           # button number -> {'on','ever','count','last'}
-# axis name -> [min, max] ever seen since reset. HIST is a ROLLING window kept
-# for the sparkline and the jitter stats, so it cannot answer "did this channel
-# ever move" - a pedal press ages out of it and the card goes back to claiming
-# the channel has never moved. That is the whole point of a latching dashboard,
-# so the latch gets its own storage.
+# axis name -> [min, max] ever seen since reset. Separate storage from HIST,
+# which is a rolling window: a press ages out of it, but must not age out of the
+# latch this dashboard exists to keep.
 SEEN = {}
 HAT = {'value': None, 'ever': set()}
 STATE = {
@@ -131,16 +96,13 @@ STATE = {
     'spare': None,
     'size_warn': None,
     'btn_init': False,
-    # The base is send-on-change: at rest it transmits NOTHING. A stream that
-    # died therefore looks exactly like a control that produces no data, and
-    # 'rate' freezes at its last value and keeps claiming the stream is live.
-    # Track when the last report actually landed so the page can say so.
+    # A dead stream looks exactly like a control that produces no data, so track
+    # when a report last landed rather than letting 'rate' freeze at its old value.
     'last_report_t': None,
 }
 
-# DROPOUT is logged but deliberately NOT a fault: the base is send-on-change, so
-# every rest longer than GAP fires one. Counting them buried the real JUMP/RAIL
-# catches under a glitch total made almost entirely of the rig sitting still.
+# DROPOUT is excluded: every rest longer than GAP fires one, which would bury the
+# real JUMP/RAIL catches under a total made of the rig sitting still.
 FAULT_KINDS = {'JUMP', 'RAIL'}
 
 
@@ -184,13 +146,11 @@ def install_layout(layout):
 def note_axis(name, val, now):
     """Record one axis sample: rolling history AND the latched min/max.
 
-    One function so the latch can never be updated in one code path and missed
-    in another - the sparkline forgetting a pedal press is survivable, the latch
-    forgetting one is the bug this dashboard exists to not have.
+    One function, so no code path can update the history and miss the latch.
     """
-    if val is None:                 # report too short for this axis - one place
-        return                      # to handle it, so no caller can seed a
-    HIST[name].append((now, val))   # [None, None] latch and crash the next one
+    if val is None:                 # report too short for this axis; handled
+        return                      # here so no caller can seed a [None, None]
+    HIST[name].append((now, val))   # latch and crash on the next sample
     seen = SEEN.get(name)
     if seen is None:
         SEEN[name] = [val, val]
@@ -226,14 +186,12 @@ def button_mask(rep, spec):
 def decode_vendor(rep):
     """Firmware version / wheel id / pedal presence out of the vendor block.
 
-    Mirrors ftecff_raw_event() in hid-ftecff.c, shifted by one: the driver
-    expects a NUMBERED 34-byte report (data[0] == 0x01) while this base sends
-    33 bytes with no report id, which is exactly why its sysfs wheel_id,
-    fw_version and tuning values all stay 0.
+    Mirrors ftecff_raw_event() in hid-ftecff.c, shifted by one for the report id
+    this base does not send - which is why its sysfs copies read 0. See
+    docs/driver.md.
     """
     out = {}
-    if len(rep) != 33:
-        # these offsets are only meaningful for this base's report shape
+    if len(rep) != 33:               # offsets only mean anything at this shape
         return out
     if rep[29] == 0xff:
         if rep[30] == 0x04:
@@ -247,9 +205,8 @@ def decode_vendor(rep):
 
 def note_buttons(mask, spec, now):
     """Latch button state; log presses, and log a first-ever press loudly."""
-    # A bit that was already high in the very first report we saw was never
-    # observed going down, which is what "stuck on" means. Distinguish that from
-    # a button the user is simply holding, which we watched go down.
+    # A bit high in the first report was never watched going down = "stuck on",
+    # as opposed to a button someone is simply holding.
     first_report = not STATE['btn_init']
     STATE['btn_init'] = True
     first = spec['first_usage']
@@ -379,8 +336,7 @@ def reader():
                                 event('JUMP', name, f'{old} -> {val}  (D{val-old:+})')
                             prev[name] = val
 
-                            # only log ENTERING a rail; a channel that simply
-                            # rests at a rail must not spam the log
+                            # only ENTERING a rail; resting at one must not spam
                             at_rail = ax['bits'] == 16 and val in (0, 65535)
                             if name in railed and at_rail and not railed[name]:
                                 event('RAIL', name,
@@ -441,9 +397,8 @@ def snapshot():
         warnings = list(LAYOUT['warnings'])
         if STATE['size_warn']:
             warnings.append(STATE['size_warn'])
-        # A frozen 'rate' from a stream that stopped minutes ago is worse than
-        # no number at all - it is what made a silent base read as "the brake
-        # card is broken". Report the silence explicitly and zero the rate.
+        # Report the silence explicitly and zero the rate: a frozen 'rate' from a
+        # stream that died minutes ago is worse than no number at all.
         silent = None if STATE['last_report_t'] is None else round(
             now - STATE['last_report_t'], 1)
         live = silent is not None and silent <= GAP
@@ -510,10 +465,8 @@ def snapshot():
             ch['idle'] = seen is None or ch['span'] == 0
             out['axes'].append(ch)
 
-            # Motion attribution: what actually responded in the last WINDOW.
-            # Wiggle one control and only that control should appear here - this
-            # is how you tell a real cross-channel link from a sparkline that
-            # merely auto-scaled some resting LSB dither into a big wiggle.
+            # Motion attribution: what actually responded in the last WINDOW, so
+            # a real cross-channel link can be told from an autoscaled sparkline.
             if len(recent) > 1:
                 move = max(recent) - min(recent)
                 floor = MOTION_MIN16 if wide else MOTION_MIN8
@@ -538,8 +491,7 @@ def snapshot():
                     'on': bool(rec and rec['on']),
                     'ever': bool(rec and rec['ever']),
                     'count': rec['count'] if rec else 0,
-                    # high since the first report we ever saw, i.e. never
-                    # observed going down -> likely shorted
+                    # never observed going down -> likely shorted
                     'stuck': bool(rec and rec['on'] and rec['from_start']),
                 })
             out['btn_seen'] = [b['n'] for b in out['buttons'] if b['ever']]
@@ -566,10 +518,8 @@ def snapshot():
             out['undecoded'] = [i for i in range(len(lo))
                                 if hi[i] != lo[i] and i not in labels]
 
-    # Outside LOCK on purpose. ffb keeps its own tiny state behind its own lock
-    # and does no I/O here, so it rides along on the 10Hz poll and the FFB card
-    # gets live progress for free - but it must not widen the window in which
-    # the reader thread is blocked waiting for a request handler.
+    # Outside LOCK on purpose: ffb has its own lock and does no I/O, so it can
+    # ride the 10Hz poll without widening the window that blocks the reader.
     out['ffb'] = ffb.status()
     out['ffb_enabled'] = FFB_ENABLED
     return out
@@ -663,9 +613,8 @@ PAGE = """<!doctype html>
   #motion .nmw { min-width:110px; color:#7ad4ee; }
 
   /* ---- system checks -------------------------------------------------- */
-  /* Status dots are round and small on purpose: the button grid below uses
-     green for "held down" and red for "stuck", which is a different meaning
-     of the same colours. Different shape keeps the two vocabularies apart. */
+  /* Dots are round to keep them apart from the button grid, which uses the
+     same colours for a different meaning. */
   #sys { border:1px solid #262b34; border-radius:6px; background:#141821;
          margin-bottom:10px; }
   #syshead { display:flex; gap:10px; align-items:center; padding:9px 12px;
@@ -685,10 +634,8 @@ PAGE = """<!doctype html>
   .chk .lab { flex:0 0 108px; color:#9aa6b8; font-size:12px; }
   .chk .det { flex:1 1 220px; min-width:0; }
   .chk .why { color:#5f6878; font-size:11px; margin-top:3px; }
-  /* user-select:all is the point: navigator.clipboard needs a secure context,
-     so it works on localhost and silently does NOTHING over http on the LAN -
-     i.e. on the phone that is actually next to the rig. One tap selects the
-     whole command instead. */
+  /* user-select:all, not navigator.clipboard, which needs a secure context and
+     so does nothing over http on the LAN - i.e. on the phone beside the rig. */
   .fix { display:block; margin-top:6px; padding:5px 8px; border-radius:4px;
          background:#0d0f13; border:1px solid #2a313c; color:#7ad4ee;
          font-size:11.5px; word-break:break-all;
@@ -789,9 +736,8 @@ function spark(cv, vals) {
   g.stroke();
 }
 
-// The sparkline auto-scales, so a channel resting with +-30 LSB of ADC dither
-// draws the same dramatic wiggle as a real sweep. Always print the y-range
-// next to it, and show an absolute full-scale bar, so it cannot mislead.
+// The sparkline auto-scales, so resting dither draws like a real sweep - hence
+// the printed y-range and the absolute full-scale bar beside it.
 function axisCard(el, c, small) {
   const twitchy = c.warn;
   el.className = 'card' + (twitchy ? ' warn' : '') + (c.idle ? ' idle' : '');
@@ -858,9 +804,8 @@ function fixHtml(cmd) {
 
 function renderBanner(d) {
   const b = document.getElementById('banner');
-  // The base is send-on-change, so silence at rest is NORMAL and must not cry
-  // wolf. Silence is a clause appended to whatever the headline is, never a
-  // replacement for it - only a long freeze invalidates a test you just ran.
+  // Silence at rest is normal, so it is a clause appended to the headline, never
+  // a replacement for it - only a long freeze invalidates a test just run.
   const quiet = d.frozen
     ? '   |   NO REPORTS FOR ' + d.silent_for + 's - THIS PAGE IS FROZEN, not '
       + 'idle. The base transmits only when something changes, so a control '
@@ -871,8 +816,7 @@ function renderBanner(d) {
 
   if (!d.connected) {
     b.className = 'bad';
-    // "not connected" used to be the end of the story, and the answer was in a
-    // markdown file. The system checks know which of the three causes it is.
+    // The system checks know which of the three causes this is.
     if (SYS && !SYS.driver_ok) {
       b.textContent = 'DRIVER NOT LOADED - the fanatec driver has not claimed '
                     + 'the base, so there is nothing to read.';
@@ -884,7 +828,6 @@ function renderBanner(d) {
       b.textContent = 'DEVICE NOT CONNECTED - ' + d.dev;
     }
   } else if (d.count === 0) {
-    // The single most expensive false conclusion this rig produces.
     if (SYS && !SYS.hidraw_real) {
       b.className = 'bad';
       b.textContent = 'READING THE WRONG DEVICE - the node opened, but it is '
@@ -900,9 +843,8 @@ function renderBanner(d) {
                     + '(' + d.uptime + 's waiting)';
     }
   } else if (d.glitches > 0) {
-    // Latched glitches stay the headline even while the base is silent - that
-    // is the whole point of latching, and "come back later and read the page"
-    // is by definition a moment when nothing is moving.
+    // Latched glitches stay the headline even while the base is silent: coming
+    // back later to read the page is by definition a quiet moment.
     b.className = 'bad';
     b.textContent = d.glitches + ' GLITCH EVENT(S) CAUGHT - see log below   |   '
                   + d.rate + ' rep/s, ' + d.count + ' total, ' + d.uptime + 's'
@@ -1023,8 +965,7 @@ function renderSystem(s) {
     + (c.why ? '<div class="why">' + esc(c.why) + '</div>' : '')
     + fixHtml(c.fix)
     + '</span></div>').join('');
-  // Open itself when something is actually broken, but never fight a user who
-  // has already decided how they want it.
+  // Open when something is broken, but never fight a user who has chosen.
   if (s.overall === 'bad' && !sysTouched
       && !document.getElementById('sys').classList.contains('open')) {
     toggleSys();
@@ -1192,9 +1133,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path.startswith('/data'):
             self._json(snapshot())
         elif self.path.startswith('/system'):
-            # Cached with its own TTL in sysstate, so a browser polling this
-            # every few seconds costs one set of filesystem reads, not many.
-            self._json(sysstate.state())
+            self._json(sysstate.state())   # cached with its own TTL in sysstate
         elif self.path == '/':
             self._send(PAGE.encode(), 'text/html; charset=utf-8')
         else:
@@ -1210,8 +1149,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({'ok': False, 'msg': 'FFB disabled (--no-ffb)'}, 403)
                 return
             ok, msg = ffb.start()
-            # 409 for "already running" so a double-tap on a phone cannot
-            # stack two effect uploads on the same slot.
             self._json({'ok': ok, 'msg': msg}, 200 if ok else 409)
         elif self.path == '/ffb/abort':
             ok, msg = ffb.abort()
@@ -1235,17 +1172,15 @@ def lan_ip():
 
 
 if __name__ == '__main__':
-    # The FFB routes physically move the wheel and this server has no auth, so
-    # anything on the LAN can POST them. Fine for a rig on a home network, but
-    # it should be one flag to take that off the table.
+    # No auth here, so anything on the LAN can POST the routes that move the
+    # wheel. One flag takes that off the table.
     if '--no-ffb' in sys.argv:
         FFB_ENABLED = False
 
     threading.Thread(target=reader, daemon=True).start()
     srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
     ip = lan_ip()
-    # flush explicitly: stdout is block-buffered when this is redirected or
-    # backgrounded, which would hide the URLs until the process exits
+    # flush: stdout is block-buffered when redirected, hiding the URLs until exit
     print(f'  local:  http://localhost:{PORT}', flush=True)
     if ip:
         print(f'  phone:  http://{ip}:{PORT}', flush=True)

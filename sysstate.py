@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 """Detect whether this machine is in a state where the dashboard can be trusted.
 
-The rig's single most expensive failure mode is not a broken pedal - it is
-reading the WRONG DEVICE and concluding the hardware is dead. The driver
-creates a virtual PID passthrough device alongside the real base, and a hidraw
-node pointing at it opens fine and delivers zero reports forever. That is
-indistinguishable, on screen, from a base that is powered off.
-
-So every question the old setup/verify-ffb.sh answered, plus the ones that were
-only ever written down by hand in the README ("this machine is currently left in
-the diagnostic HID state"), is answered here by looking at the machine instead.
-
-Everything below is a filesystem read. Nothing here needs root, nothing opens a
-device for I/O, and nothing is ever executed - when a check fails it reports the
-command that fixes it and leaves running it to a human.
+Every check is a filesystem read: no root, no device opened for I/O, nothing ever
+executed. A failing check reports the command that fixes it and stops there.
 
 Run directly to dump the state as JSON.
 """
@@ -35,17 +24,15 @@ DRIVER_DIR = '/sys/bus/hid/drivers/fanatec'
 MODULE = 'hid_fanatec'
 VENDOR_MATCH = '0EB7'
 
-# Two browsers polling should not multiply sysfs reads, and the reader thread
-# must never wait on this. Own lock, own cache, never touches pedal-web's LOCK.
+# Own lock and cache, so many pollers cost one set of reads and the reader
+# thread never waits on pedal-web's LOCK.
 TTL = 2.0
 _LOCK = threading.Lock()
 _CACHE = {'t': 0.0, 'data': None}
 
-# linux/input-event-codes.h. Bit N of capabilities/ff means effect type N is
-# supported. Reading that file needs no permissions at all, which is why it
-# beats the EVIOCGBIT ioctl the old verify-ffb.sh used - the ioctl needed the
-# device open and printed "permission denied" on exactly the machine state we
-# most need to describe.
+# linux/input-event-codes.h: bit N of sysfs capabilities/ff means effect type N.
+# Read from sysfs rather than via EVIOCGBIT, which needs the device open and so
+# fails on exactly the machine states worth describing.
 FF_EFFECTS = {
     0x50: 'RUMBLE', 0x51: 'PERIODIC', 0x52: 'CONSTANT', 0x53: 'SPRING',
     0x54: 'FRICTION', 0x55: 'DAMPER', 0x56: 'INERTIA', 0x57: 'RAMP',
@@ -75,11 +62,7 @@ def read_text(path):
 
 
 def hid_id_of(hidraw_path):
-    """The HID device a hidraw node belongs to, e.g. 0003:0EB7:0E03.0109.
-
-    FINDINGS talks in these ids ('.0107 is the real base, .0108 is the virtual
-    PID device'), so showing it makes the notes and the screen line up.
-    """
+    """The HID device a hidraw node belongs to, e.g. 0003:0EB7:0E03.0109."""
     node = os.path.basename(hidraw_path)
     link = f'/sys/class/hidraw/{node}/device'
     try:
@@ -91,9 +74,8 @@ def hid_id_of(hidraw_path):
 def decode_ff(raw):
     """Effect names from a sysfs capabilities/ff bitmask.
 
-    The kernel prints the bitmap as space-separated longs, most significant
-    first, so the words are reversed before shifting. 64-bit longs assumed;
-    this project is x86_64 only (see the struct packing in ffb.py).
+    The kernel prints it as space-separated longs, most significant first, so the
+    words are reversed before shifting. x86_64 only: 64-bit longs assumed.
     """
     words = raw.split()
     value = 0
@@ -106,9 +88,7 @@ def check_driver():
     mods = read_text('/proc/modules') or ''
     loaded = any(line.split(' ')[0] == MODULE for line in mods.splitlines())
     bound = [os.path.basename(p) for p in glob.glob(f'{DRIVER_DIR}/*{VENDOR_MATCH}*')]
-    # dkms status is NOT a usable probe: dkms is not even installed on this box
-    # yet the module is loaded and bound. /proc/modules plus the bound symlink
-    # are the reliable root-free signals.
+    # dkms status is not a usable probe here; see docs/driver.md.
     if loaded and bound:
         return chk('driver', 'FFB driver', 'ok',
                    f'{MODULE} loaded, claiming {", ".join(bound)}')
@@ -141,10 +121,8 @@ def check_nodes(nodes):
 def check_hidraw_target(nodes):
     """Is hidraw the REAL base, or the driver's virtual PID device?
 
-    This is the check the whole module exists for. The descriptor answers it
-    without ambiguity: the real base declares the 33-byte joystick report with
-    four analog axes and 108 buttons. The PID passthrough device declares
-    nothing of the sort, so the parse yields no axes and hid_layout falls back.
+    The check this module exists for; see docs/driver.md. Only the real base
+    declares the 33-byte report with four analog axes and 108 buttons.
     """
     node = nodes.get('hidraw')
     if not node:
@@ -176,9 +154,8 @@ def check_hidraw_target(nodes):
 def check_diagnostic_state():
     """Is the box left in the modified HID state?
 
-    /sys/module/hid_fanatec/parameters/hidraw_pid does not exist, so the live
-    kernel parameter cannot be read back; the modprobe.d file is the only
-    available proxy for 'somebody deliberately turned this on'.
+    The live hidraw_pid parameter cannot be read back, so the modprobe.d file is
+    the only available proxy for 'somebody deliberately turned this on'.
     """
     text = read_text(MODPROBE_CONF)
     if text is None:
@@ -246,7 +223,7 @@ def check_games_group():
 
 
 def check_ffb_writable(nodes):
-    """Can the FFB test actually run? Decided here so the card can say why not."""
+    """Can the FFB test run? Decided here so the card can say why not."""
     node = nodes.get('event')
     if not node:
         return chk('ffb_writable', 'FFB test', 'bad', 'no event node',
