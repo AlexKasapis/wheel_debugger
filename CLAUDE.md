@@ -90,8 +90,11 @@ web/           index.html + app.css + app.js, served from a fixed table
 Change the byte offsets and all three must move together, or the tool becomes
 confidently wrong — the worst failure mode here:
 
-1. `hid_layout.KNOWN_AXES` — one table that builds `fallback_layout()`, derives
-   `KNOWN_OFFSETS`, and sanity-checks whatever the descriptor parse produces
+1. `hid_layout.KNOWN_AXES` — one table that builds the axes in
+   `fallback_layout()`, derives `KNOWN_OFFSETS`, and sanity-checks whatever the
+   descriptor parse produces. The *non-axis* facts are still written out
+   separately in `fallback_layout()`: the hat nibble, `first_bit 4` / 108
+   buttons, `spare_bits`, and the vendor block.
 2. `docs/report-map.md` — `build_layout()` literally emits *"docs/report-map.md
    offsets are stale"* when the parsed descriptor disagrees
 3. Sections [1] and [2] of the self-test
