@@ -12,6 +12,101 @@ The box is left in the **modified HID state for diagnostics**:
   and the driver was bound, but it was sending **zero HID reports** — it had
   been streaming at ~9/s earlier the same day. Suspect base power / standby.
 
+## *** FULL REPORT MAP — PROVEN, from the base's own HID descriptor ***
+Parsed from `/sys/class/hidraw/hidrawN/device/report_descriptor` (133 bytes) by
+`hid_layout.py`. This is not inferred from wiggling things; it is what the device
+declares. It **supersedes all earlier guesses about byte offsets**, and it agrees
+with every offset previously established by capture.
+
+There is **no report ID**. The descriptor declares no Report ID item, so the
+33-byte report is pure payload. The earlier note "33 bytes, id 0x08" was a
+misreading: `0x08` is byte 0's hat nibble at rest (8 = centred).
+
+    byte  0  bits 0-3   hat switch, 0-7 = N..NW, 8 = centred
+    bits  4-111         108 buttons, LSB-first  (= bytes 0-13 exactly)
+    bits  112-127       16 further declared button bits — NOT buttons on this
+                        base: byte 14 = 0x00, byte 15 = constant 0x16
+    byte 16  u16 LE  X       STEER
+    byte 18  u16 LE  Z       THROTTLE   (throttle-IN jack)
+    byte 20  u16 LE  Rz      BRAKE      (brake-IN jack, load cell)
+    byte 22  u16 LE  Y       CLUTCH     (clutch-IN jack)   <-- was never decoded
+    byte 24  s8      Rx      rim ministick X
+    byte 25  s8      Ry      rim ministick Y
+    byte 26  u8      Slider
+    byte 27  s8      Dial
+    bytes 28-32      vendor-defined (fw version / wheel id / pedal presence)
+
+Button number N sits at bit N+3, i.e. byte `(N+3)//8`, bit `(N+3)%8`.
+So **button 5 = GEAR UP = byte 1 bit 0** and **button 6 = GEAR DOWN = byte 1
+bit 1** (functions per the `ftec_keymap` comments in `hid-ftec.c`).
+
+Resting values from the archived capture (`data/raw-pedal-map.log`, first report
+of the steering phase):
+STEER 32783 (centred), THROTTLE 65535, BRAKE 65535, **CLUTCH 65535**,
+ministick 0/0, Slider 255, Dial −4. The clutch channel resting at 65535 is the
+same rest value as the other two pot channels — i.e. it looks like a normal
+released pedal input, not a floating pin.
+
+Verified offline by `tools/selftest-decode.py`, which replays the archived
+reports through the decoders and asserts every offset, the button bit math, and
+that byte 15's constant `0x16` produces no phantom button.
+
+## *** "REMAINING PUZZLE" CLOSED — why wheel_id / fw_version / tuning are 0 ***
+`ftecff_raw_event()` (hid-ftecff.c:1370) only parses wheel info when
+`data[0] == 0x01 && size == FTEC_WHEEL_REPORT_SIZE (34)` — a **numbered** 34-byte
+report. This base sends **33 bytes with no report ID**, so that branch never
+runs. Nothing is wrong with the base and it is not refusing info requests; the
+driver's parser simply does not match this device's report format. Same reason
+the 64-byte tuning report never lands, so `ftec_tuning/*` (including `ACP`) all
+read 0 — that is **"no data", not "mode 0"**.
+
+Decoding the vendor block ourselves with the driver's own field offsets
+(shifted by one for the missing ID byte) gives, from the archived capture:
+
+    fw_version = LE16(byte 31, byte 32) = 0x02b5 = 693   <-- matches the base's
+                                                            boot display and
+                                                            bcdDevice 0693
+    wheel_id   = byte 30 = 0x20   (not in hid-ftec.h's known-rim list)
+    when byte 29 == 0xff and byte 30 == 0x04:
+        byte 31 low nibble  = pedals connected
+        byte 31 high nibble = handbrake connected
+
+The dashboard now shows all of these live, so `wheel_id` no longer has to be
+taken as "0x00 = fallback mapping".
+
+## OPEN QUESTIONS AND THE TEST FOR EACH (not yet resolved)
+1. **Does the clutch pedal reach byte 22?** The channel exists and rests at a
+   sane value, but no capture has ever shown it move. Test: press the clutch
+   and watch the CLUTCH card. *Unproven either way until then.*
+2. **HYPOTHESIS — the rim's analog paddles may be hijacking the clutch axis.**
+   Fanatec's `ACP` (Analogue Paddles) setting defaults to `1 CbP` = "clutch bite
+   point, paddles work in parallel", i.e. on a rim with analog paddles the
+   PADDLES drive the clutch axis, and upstream's own README warns mode `4 AnA`
+   is "shared and interferes with analog ministick if present". If that is
+   active, a clutch pedal plugged into a perfectly good jack would produce
+   nothing — which is **exactly** the swap-bisect's null result.
+   => The "clutch-IN channel is DEAD" conclusion below is **NOT safe**. Do not
+   resolder the board yet.
+   Test: `tools/raw-pedal-map.py` PHASE 6 — squeeze the analog paddles and watch
+   CLUTCH / SLIDER / DIAL. If a paddle moves byte 22, the channel is alive and
+   merely overridden. `ACP` cannot be read from sysfs (see above); read it from
+   the base's own tuning display instead.
+3. **Do the shift paddles report at all?** They are buttons 5 and 6. The one
+   prior evdev capture saw buttons 1-4, 7-12, 22, 24, 26 and **not** 5 or 6 —
+   but that capture was for pedals and never asked for paddle presses, so it is
+   not evidence. Test: `tools/raw-pedal-map.py` PHASE 5, or press them and watch
+   the dashboard's button grid go blue.
+4. **Does the ministick really move STEER?** The descriptor says no: STEER is
+   X at byte 16, the ministick is Rx/Ry at bytes 24-25 — separate fields.
+   The likely explanation for what was observed is mechanical: pushing a thumb
+   stick on a rim that does not self-centre and has FFB idle **physically
+   rotates the wheel**. A contributing factor was the dashboard's auto-scaled
+   sparkline, which drew ±30 LSB of resting ADC dither as a full-height wiggle.
+   Test: **hold the rim firmly still** and move only the ministick
+   (`raw-pedal-map.py` PHASE 7). STEER dithering by tens of LSB = independent,
+   as declared. STEER swinging thousands of LSB with the rim held = something
+   really is shared, and ACP mode 4 becomes the suspect.
+
 ## Hardware
 - Wheel base: Endor AG FANATEC CSL Elite Wheel Base, USB `0eb7:0e03`
 - Nodes: `/dev/input/event6`, `/dev/input/js1`, `hidraw8`
@@ -55,7 +150,7 @@ The box is left in the **modified HID state for diagnostics**:
 2. udev rules did NOT apply — rule guards on `ACTION=="add|change"`, but a
    sysfs bind emits `bind`. LED brightness still root:root, not :games.
    Replug/reboot fixes this too.
-3. `games` group added to alex — needs re-login to take effect.
+3. `games` group added to the desktop user — needs re-login to take effect.
 4. **Throttle fault** — user reports a long-standing issue. Deferred.
    Diagnose only AFTER the power-cycle, against the NEW axis map.
    Also needs `wheel_id` resolved first: `0x00` means the button/axis
@@ -179,10 +274,13 @@ User ran raw-pedal-map.py on ORIGINAL wiring, then swapped the throttle and
 clutch connectors on the controller board and ran pedal-map.py. Prompts refer
 to the PEDAL pressed, not the input it was plugged into.
 
-Raw report is 33 bytes, id 0x08. Channel -> byte offsets (LE u16):
+Raw report is 33 bytes. Channel -> byte offsets (LE u16):
     steering      [16:17]
     throttle-IN   [18:19]   (= driver axis Z)
     brake-IN      [20:21]   (= driver axis RZ)
+  [AMENDED: there is no report id — the 0x08 read as one is byte 0's hat
+   nibble at rest. The clutch-IN channel is [22:23] (axis Y); it was simply
+   never decoded. See FULL REPORT MAP at the top.]
 
   RUN 1 (original wiring, RAW bytes):
     steering        789 -> 64745   97.6%   OK
@@ -197,6 +295,10 @@ Raw report is 33 bytes, id 0x08. Channel -> byte offsets (LE u16):
                                     only 7 reversals = SMOOTH
 
 CONCLUSION (substitution proves each half):
+  ** "clutch-IN : DEAD" IS NO LONGER SAFE — see OPEN QUESTIONS #2 at the top.
+     The rim's analog paddles may be driving the clutch axis (Fanatec ACP),
+     which would make a good jack produce exactly this null result. Also, the
+     capture tool of the time never decoded byte 22 at all. **
   * throttle-IN channel  : GOOD  - clutch pedal read smoothly through it
   * clutch-IN channel    : DEAD  - two different pedals both produced NOTHING;
                            raw capture shows the base sends no report at all
@@ -216,11 +318,13 @@ REPAIR TARGETS:
      joints and whether the sensor supply voltage is present on that header
      (compare against the working throttle header while powered).
 
-## REMAINING PUZZLE
+## REMAINING PUZZLE (SOLVED - see the section near the top)
 wheel_id/fw_version/tuning all still 0 even though input reports flow.
-=> base answers normal input polling but not the driver's info-request reports
-   (0xf8 0x09 sequence, hid-ftecff.c:1188-1195). Affects sysfs tuning + `range`,
-   not necessarily FFB. Possibly firmware-version dependent.
+=> ~~base answers normal input polling but not the driver's info-request
+   reports~~ WRONG. The base sends the info fine, inside the ordinary 33-byte
+   input report. The driver's parser requires a NUMBERED 34-byte report
+   (`data[0]==0x01 && size==34`) and so never reads it. fw_version decodes to
+   693 straight out of the raw bytes. Affects sysfs tuning + `range`, not FFB.
 
 ## OLD NEXT TEST (superseded)
 Capture /dev/hidraw8 while the user turns the wheel / presses pedals.
@@ -275,16 +379,31 @@ was ruined. ALWAYS mark pot body->shaft with a marker + photo before removing.
   /dev/input/by-id/usb-Fanatec_*-hidraw, never a hardcoded hidrawN.
 
 ## Scripts
+- `hid_layout.py`   — parses the base's HID report descriptor into the field map
+                      every other tool uses. Falls back to hardcoded CSL Elite
+                      offsets and says so loudly. Run it directly to dump the
+                      layout as JSON.
 - `pedal-web.py`    — LOCAL WEB DASHBOARD, http://localhost:8765 (also LAN, for
                       phone). Background thread reads hidraw at full rate and
                       LATCHES glitches (JUMP >3000 delta, RAIL entry, DROPOUT
                       >2 s) so an intermittent fault that lasts 20 ms still
-                      shows. Live sparklines, rolling stdev, per-byte min/max
-                      grid, and auto-detection of unknown 16-bit channels that
-                      start moving (= how a revived clutch channel announces
-                      itself). Stdlib only. Verified pulling real 33-byte
-                      reports.
-- `raw-live.py`     — terminal-only live readout, same channels
+                      shows. Decodes EVERYTHING the base sends: 4 analog axes
+                      incl. CLUTCH, ministick/slider/dial, hat switch, all 108
+                      button bits (grey = never seen / blue = seen / green =
+                      down / red = stuck on, with rim function on hover), and
+                      the vendor block (fw, wheel_id, pedal presence).
+                      Latches first-ever button presses as BTN-NEW events, so
+                      "press every button once" gives a definitive list of which
+                      ones report. A LIVE MOTION panel names whatever changed in
+                      the last 2 s — wiggle one control and see exactly which
+                      field answers. Sparklines print their y-range so resting
+                      ADC dither can no longer masquerade as movement, and every
+                      16-bit channel also gets an absolute full-scale bar.
+                      Stdlib only.
+- `raw-live.py`     — terminal-only live readout, all channels + buttons + hat
+- `selftest-decode.py` — replays the archived captures in `data/` through the
+                      decoders and asserts the report map. Runs with the base
+                      powered OFF; use it after touching any offset logic.
 - `install-ffb.sh`  — root install (already run successfully)
 - `verify-ffb.sh`   — checks ff caps + effects (note: its js-node glob and
                       driver readlink are cosmetically wrong; ff decode in it

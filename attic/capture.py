@@ -1,6 +1,6 @@
 import os, glob, select, time, collections, sys
 
-out = open('/tmp/claude-1000/-home-alex/0244953b-932d-4027-95ec-08cb1c49be8d/scratchpad/capture.log','w',buffering=1)
+out = open('capture.log','w',buffering=1)
 def p(*a):
     print(*a, file=out); print(*a)
 

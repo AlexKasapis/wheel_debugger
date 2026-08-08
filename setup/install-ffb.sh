@@ -4,7 +4,7 @@
 # from SUDO_USER so it can be added to the 'games' group):
 #     sudo bash setup/install-ffb.sh
 # From a root shell, pass it explicitly:
-#     REAL_USER=alex bash setup/install-ffb.sh
+#     REAL_USER=yourname bash setup/install-ffb.sh
 set -euo pipefail
 
 VERSION="0.2.3"
@@ -24,7 +24,7 @@ UPSTREAM="https://github.com/gotzl/hid-fanatecff.git"
 if [ -z "${REAL_USER}" ] || [ "${REAL_USER}" = "root" ]; then
     echo "!! could not determine the desktop user (got '${REAL_USER}')." >&2
     echo "   Run this with sudo, or set it explicitly:" >&2
-    echo "     REAL_USER=alex bash setup/install-ffb.sh" >&2
+    echo "     REAL_USER=yourname bash setup/install-ffb.sh" >&2
     exit 1
 fi
 

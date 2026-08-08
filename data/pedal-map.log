@@ -46,4 +46,4 @@ SUMMARY - pedal to axis mapping
     Z          span     33  stdev     11.5  reversals     5  samples 7
     (a healthy held pedal should be near-flat; large span/reversals = twitch)
 
-log written to /tmp/claude-1000/-home-alex/0244953b-932d-4027-95ec-08cb1c49be8d/scratchpad/pedal-map.log
+log written to logs/pedal-map.log

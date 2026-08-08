@@ -1,5 +1,5 @@
 import os, glob, select, time, struct, collections
-LOG='/tmp/claude-1000/-home-alex/0244953b-932d-4027-95ec-08cb1c49be8d/scratchpad/capture2.log'
+LOG='capture2.log'
 out=open(LOG,'w',buffering=1)
 def p(*a): print(*a,file=out)
 

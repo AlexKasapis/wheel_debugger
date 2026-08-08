@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Self-test for the raw-HID decoders - runs with the base powered OFF.
+
+Replays the real reports archived in data/raw-pedal-map.log through
+hid_layout.py and pedal-web.py's decoders and asserts the result. This exists
+because every "the dashboard does not show my clutch / my buttons" bug in this
+project came from an unverified byte offset, and the base only streams while
+someone is physically at the rig.
+
+If /dev/hidraw for the base is readable the layout comes from the device's own
+report descriptor; otherwise the hardcoded CSL Elite fallback is tested.
+
+Run:  python3 tools/selftest-decode.py
+"""
+import glob
+import importlib.util
+import json
+import os
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+import hid_layout                                          # noqa: E402
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+pw = _load('pedal_web', os.path.join(ROOT, 'pedal-web.py'))
+rpm = _load('raw_pedal_map', os.path.join(ROOT, 'tools', 'raw-pedal-map.py'))
+
+FAILS = []
+
+
+def ck(label, got, want):
+    ok = got == want
+    if not ok:
+        FAILS.append(f'{label}: got {got!r}, want {want!r}')
+    print(('  ok   ' if ok else '  FAIL ') + f'{label} = {got!r}'
+          + ('' if ok else f'   want {want!r}'))
+
+
+def hx(s):
+    return bytes(int(x, 16) for x in s.split())
+
+
+# Verbatim first-report hex from data/raw-pedal-map.log, one per capture phase.
+# Nothing but the pedal named in each phase was touched.
+STEER_PHASE = hx('08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 16 0f 80 ff ff '
+                 'ff ff ff ff 00 00 ff fc 27 02 20 b5 02')
+THR_PHASE = hx('08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 16 5d 81 39 ff '
+               'ff ff ff ff 00 00 ff fc 27 02 20 b5 02')
+BRK_PHASE = hx('08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 16 5d 81 ff ff '
+               '7f ff ff ff 00 00 ff fc 27 02 20 b5 02')
+
+
+def get_layout():
+    found = glob.glob('/dev/input/by-id/usb-Fanatec_*-hidraw')
+    if found and os.access(os.path.realpath(found[0]), os.R_OK):
+        return hid_layout.layout_for(found[0]), 'live device descriptor'
+    return hid_layout.fallback_layout('no readable base'), 'hardcoded fallback'
+
+
+def main():
+    layout, how = get_layout()
+    print(f'layout from: {how}  ({layout["source"]})')
+
+    print('\n[1] layout matches the documented report map')
+    ck('report size', layout['size'], hid_layout.KNOWN_SIZE)
+    for name, byte in sorted(hid_layout.KNOWN_OFFSETS.items(),
+                             key=lambda kv: kv[1]):
+        got = next((a['byte'] for a in layout['axes'] if a['name'] == name), None)
+        ck(f'{name:<8} byte', got, byte)
+    ck('button count', layout['buttons']['count'], 108)
+    ck('first button bit', layout['buttons']['first_bit'], 4)
+    ck('hat at byte 0 low nibble',
+       (layout['hat']['byte'], layout['hat']['shift']), (0, 0))
+    if how == 'live device descriptor':
+        ck('no layout warnings', layout['warnings'], [])
+
+    by = {a['name']: a for a in layout['axes']}
+
+    print('\n[2] axis decode of the archived steering-phase report')
+    ck('STEER    centred', pw.axis_value(STEER_PHASE, by['STEER']), 32783)
+    ck('THROTTLE at rest', pw.axis_value(STEER_PHASE, by['THROTTLE']), 65535)
+    ck('BRAKE    at rest', pw.axis_value(STEER_PHASE, by['BRAKE']), 65535)
+    ck('CLUTCH   at rest', pw.axis_value(STEER_PHASE, by['CLUTCH']), 65535)
+    ck('STICK-X  centred', pw.axis_value(STEER_PHASE, by['STICK-X']), 0)
+    ck('STICK-Y  centred', pw.axis_value(STEER_PHASE, by['STICK-Y']), 0)
+    ck('SLIDER', pw.axis_value(STEER_PHASE, by['SLIDER']), 255)
+    ck('DIAL signed', pw.axis_value(STEER_PHASE, by['DIAL']), -4)
+
+    print('\n[3] each capture phase moves only its own channel')
+    ck('throttle phase -> Z moved', pw.axis_value(THR_PHASE, by['THROTTLE']), 65337)
+    ck('throttle phase -> Rz still at rest',
+       pw.axis_value(THR_PHASE, by['BRAKE']), 65535)
+    ck('brake phase -> Rz moved', pw.axis_value(BRK_PHASE, by['BRAKE']), 65407)
+    ck('brake phase -> Z still at rest',
+       pw.axis_value(BRK_PHASE, by['THROTTLE']), 65535)
+
+    print('\n[4] vendor block - independent confirmation of the offsets')
+    info = pw.decode_vendor(STEER_PHASE)
+    # 693 is what the base shows on its own display at boot, and its bcdDevice
+    ck('fw_version', info.get('fw_version'), 693)
+    ck('wheel_id', info.get('wheel_id'), 0x20)
+    variant = bytearray(STEER_PHASE)
+    variant[29], variant[30], variant[31] = 0xff, 0x04, 0x11
+    ck('pedal-presence variant', pw.decode_vendor(bytes(variant)),
+       {'pedals': True, 'handbrake': True})
+
+    print('\n[5] button bit math')
+    spec = layout['buttons']
+    collisions = []
+    for n in range(spec['first_usage'], spec['first_usage'] + spec['count']):
+        bit = spec['first_bit'] + n - spec['first_usage']
+        rep = bytearray(hid_layout.KNOWN_SIZE)
+        rep[bit // 8] |= 1 << (bit % 8)
+        if pw.button_mask(bytes(rep), spec) != 1 << (n - spec['first_usage']):
+            collisions.append(n)
+    ck('all buttons decode to their own bit', collisions, [])
+    b5 = spec['first_bit'] + 5 - spec['first_usage']
+    ck('button 5 (GEAR UP) at byte 1 bit 0', (b5 // 8, b5 % 8), (1, 0))
+    ck('button 108 at byte 13 bit 7',
+       ((spec['first_bit'] + 107) // 8, (spec['first_bit'] + 107) % 8), (13, 7))
+    # byte 15 rests at a constant 0x16 on this base; it is inside the declared
+    # button block but is not a button, so it must never light a cell up
+    ck('no phantom buttons from byte 15',
+       pw.button_mask(STEER_PHASE, spec), 0)
+    ck('spare bits are bytes 14-15',
+       sorted({b // 8 for b in layout['spare_bits']}), [14, 15])
+
+    print('\n[6] full pipeline: synthesised clutch sweep + gear-up + hat')
+    pw.install_layout(layout)
+    pw.reset_tracking()
+    now = time.time()
+    sweep = list(range(65535, 20000, -4000))
+    stream = [STEER_PHASE] * 4
+    for val in sweep:
+        rep = bytearray(STEER_PHASE)
+        rep[22], rep[23] = val & 0xff, val >> 8
+        stream.append(bytes(rep))
+    gear = bytearray(STEER_PHASE)
+    gear[1] |= 0x01                                  # button 5 = GEAR UP
+    stream.append(bytes(gear))
+    stream.append(STEER_PHASE)
+    hat = bytearray(STEER_PHASE)
+    hat[0] = (STEER_PHASE[0] & 0xf0) | 2             # hat = E
+    stream.append(bytes(hat))
+
+    for rep in stream:
+        pw.STATE['count'] += 1
+        pw.STATE['report'] = rep
+        pw.STATE['size'] = len(rep)
+        if pw.STATE['lo'] is None:
+            pw.STATE['lo'], pw.STATE['hi'] = list(rep), list(rep)
+        else:
+            for i, b in enumerate(rep):
+                pw.STATE['lo'][i] = min(pw.STATE['lo'][i], b)
+                pw.STATE['hi'][i] = max(pw.STATE['hi'][i], b)
+        for ax in layout['axes']:
+            val = pw.axis_value(rep, ax)
+            if val is not None:
+                pw.HIST[ax['name']].append((now, val))
+        pw.note_buttons(pw.button_mask(rep, spec), spec, now)
+        hv = rep[layout['hat']['byte']] >> layout['hat']['shift'] & 0x0f
+        if hv != pw.HAT['value']:
+            pw.HAT['value'] = hv
+            if hv <= layout['hat']['lmax']:
+                pw.HAT['ever'].add(hv)
+        for key, val in pw.decode_vendor(rep).items():
+            pw.STATE[key] = val
+
+    snap = pw.snapshot()
+    axes = {a['name']: a for a in snap['axes']}
+    ck('CLUTCH no longer flagged idle', axes['CLUTCH']['idle'], False)
+    ck('CLUTCH span', axes['CLUTCH']['span'], max(sweep) - min(sweep))
+    ck('THROTTLE flagged idle', axes['THROTTLE']['idle'], True)
+    ck('motion panel blames CLUTCH alone',
+       [m['name'] for m in snap['motion']], ['CLUTCH'])
+    ck('button 5 latched as seen', 5 in snap['btn_seen'], True)
+    ck('button 6 still never seen', 6 in snap['btn_seen'], False)
+    ck('BTN-NEW logged for button 5',
+       any(e['kind'] == 'BTN-NEW' and e['ch'] == 'btn 5' for e in snap['events']),
+       True)
+    ck('a button we watched go down is NOT called stuck',
+       next(b['stuck'] for b in snap['buttons'] if b['n'] == 5), False)
+    ck('hat reads E', snap['hat']['dir'], 'E')
+    ck('hat E latched', snap['hat']['ever'], [2])
+    ck('fw surfaced to the page', snap['fw_version'], 693)
+    ck('no moved-but-undecoded bytes', snap['undecoded'], [])
+    ck('byte 22 labelled', snap['bytes'][22]['label'], 'CLUTCH')
+    ck('byte 15 labelled', snap['bytes'][15]['label'], 'spare button bits')
+    ck('button cells rendered', len(snap['buttons']), spec['count'])
+    json.dumps(snap)
+    print('  ok   snapshot is JSON-serialisable')
+
+    # a bit already high in the very first report was never seen going down
+    pw.reset_tracking()
+    held = bytearray(STEER_PHASE)
+    held[1] |= 0x02                                  # button 6 high from the off
+    pw.STATE['count'] = 1
+    pw.STATE['report'] = bytes(held)
+    pw.STATE['lo'] = pw.STATE['hi'] = list(held)
+    pw.note_buttons(pw.button_mask(bytes(held), spec), spec, now)
+    ck('a bit high in the first report IS called stuck',
+       next(b['stuck'] for b in pw.snapshot()['buttons'] if b['n'] == 6), True)
+
+    print('\n[7] tools/raw-pedal-map.py phase analysis')
+    lines, one = rpm.analyse([], layout)
+    ck('empty phase is reported as a real result',
+       'NO REPORTS AT ALL' in lines[0], True)
+    ck('empty phase summary', one, 'NO REPORTS - no response at all')
+    lines, one = rpm.analyse([STEER_PHASE, THR_PHASE], layout)
+    # the summary line names the biggest mover by % of range; between these two
+    # frames STEER moved 334 LSB and THROTTLE 198, so STEER wins
+    ck('summary names the biggest mover', one.split()[0], 'STEER')
+    ck('both movers listed in full',
+       [x.strip().split()[0] for x in lines if x.startswith('    ')],
+       ['STEER', 'THROTTLE'])
+    ck('reports no buttons down',
+       any('no button bit went down' in x for x in lines), True)
+    ck('no stray undecoded bytes',
+       any('UNDECODED' in x for x in lines), False)
+    lines, one = rpm.analyse([STEER_PHASE, bytes(gear)], layout)
+    ck('labels button 5 by function',
+       any('GEAR UP' in x for x in lines), True)
+    ck('phase 4/6 clutch sweep is attributed to CLUTCH',
+       'CLUTCH' in rpm.analyse(stream, layout)[1], True)
+    ck('every report byte is accounted for',
+       sorted(set(range(33)) - rpm.decoded_bytes(layout)), [])
+
+    print()
+    if FAILS:
+        print(f'{len(FAILS)} FAILURE(S):')
+        for f in FAILS:
+            print('  ' + f)
+        return 1
+    print('ALL CHECKS PASSED')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

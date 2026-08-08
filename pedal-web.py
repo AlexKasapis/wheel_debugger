@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Local web dashboard for the Fanatec pedal diagnostics.
+"""Local web dashboard for the Fanatec base's raw HID stream.
 
 A background thread reads the RAW HID reports at full rate and detects
 dropouts, rail-pinning and value jumps, then LATCHES them - so an
 intermittent fault lasting 20ms still shows on screen minutes later.
 The page polls at 10Hz; the detection runs at full report rate.
+
+Everything the base sends is decoded: 4 analog axes (steer / throttle / brake /
+clutch), the rim ministick, slider and dial, the hat switch, all 108 button
+bits and the vendor block (firmware version, wheel id, pedal presence). The
+byte offsets are not guessed - they are derived from the device's own HID report
+descriptor at startup (see hid_layout.py), and any mismatch against the
+documented layout is shown as a warning instead of silently mislabelling a
+channel.
 
 Run:   python3 pedal-web.py
 Then:  open the URL it prints (works from your phone on the same network).
@@ -22,21 +30,61 @@ import statistics
 import threading
 import time
 
-PORT = 8765
-CHANNELS = [('STEER', 16), ('THR-IN', 18), ('BRK-IN', 20)]
-KNOWN_BYTES = {16, 17, 18, 19, 20, 21}
+import hid_layout
 
-JUMP = 3000        # sample-to-sample delta that counts as a glitch
+PORT = 8765
+
+JUMP = 3000        # sample-to-sample delta that counts as a glitch (16-bit ch)
 GAP = 2.0          # seconds without a report that counts as a dropout
                    # (the base idles around 9 reports/s, so this must be loose)
-WINDOW = 2.0       # seconds for the rolling jitter stats
+WINDOW = 2.0       # seconds for the rolling jitter stats and the motion panel
 SD_WARN = 200      # rolling stdev above this = electrically noisy channel
                    # (LSB dither measures ~10; the bad throttle measured ~1380)
+MOTION_MIN16 = 200 # peak-to-peak below this in WINDOW is dither, not input.
+                   # Resting dither measures ~+-30 LSB (stdev ~10), so this
+                   # clears it comfortably while any real input is thousands.
+MOTION_MIN8 = 2
 HIST_LEN = 900
+SPARK = 180
+
+# pedal channels are pot dividers off the 3.3V sensor supply, so a voltage
+# readout is meaningful there; STEER is an encoder, so it is not
+VOLT_CHANNELS = {'THROTTLE', 'BRAKE', 'CLUTCH'}
+
+# Hardware button number -> what it is on a Fanatec rim. Taken from the
+# ftec_keymap comments in hid-fanatec 0.2.3 (hid-ftec.c), which document the
+# base's button numbering regardless of how the driver maps it to evdev codes.
+BTN_FN = {
+    1: 'Square', 2: 'Cross', 3: 'Circle', 4: 'Triangle',
+    5: 'GEAR UP  (right shift paddle)', 6: 'GEAR DOWN  (left shift paddle)',
+    7: 'R2', 8: 'L2', 9: 'SH / Start', 10: 'OP / Select', 11: 'R3', 12: 'L3',
+    13: 'Shifter R', 21: '(unknown)', 22: 'PS / Xbox / R toggle-up',
+    23: 'Funky twist left', 24: 'Funky twist right',
+    25: 'Funky push', 26: 'Ministick push',
+    27: 'L toggle-up', 28: '(unknown)',
+    29: 'Sequential gear down', 30: 'Sequential gear up',
+    31: 'R toggle-down', 32: 'L toggle-down',
+    33: 'R toggle-up-normal', 34: 'L toggle-up-normal',
+    35: '(unknown)', 36: '(unknown)',
+    61: 'L analog paddle (as button)', 62: 'R analog paddle (as button)',
+}
+for _i in range(7):
+    BTN_FN[14 + _i] = f'Shifter {_i + 1}'
+for _i in range(12):
+    _pos = (_i + 1) % 12 or 12
+    BTN_FN[37 + _i] = f'L knob pos {_pos}' + (' / twist right' if _i == 0
+                                              else ' / twist left' if _i == 1 else '')
+    BTN_FN[49 + _i] = f'R knob pos {_pos}' + (' / twist right' if _i == 0
+                                              else ' / twist left' if _i == 1 else '')
+
+HAT_DIRS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 
 LOCK = threading.Lock()
-HIST = {name: collections.deque(maxlen=HIST_LEN) for name, _ in CHANNELS}
+LAYOUT = hid_layout.fallback_layout('device not opened yet')
+HIST = {}
 EVENTS = collections.deque(maxlen=400)
+BTN = {}           # button number -> {'on','ever','count','last'}
+HAT = {'value': None, 'ever': set()}
 STATE = {
     'dev': None,
     'connected': False,
@@ -48,17 +96,128 @@ STATE = {
     'hi': None,
     'started': time.time(),
     'glitches': 0,
+    'fw_version': None,
+    'wheel_id': None,
+    'pedals': None,
+    'handbrake': None,
+    'spare': None,
+    'size_warn': None,
+    'btn_init': False,
 }
+
+FAULT_KINDS = {'JUMP', 'RAIL', 'DROPOUT'}
 
 
 def event(kind, ch, detail):
-    STATE['glitches'] += 1
+    if kind in FAULT_KINDS:
+        STATE['glitches'] += 1
     EVENTS.appendleft({
         't': round(time.time() - STATE['started'], 2),
         'kind': kind,
         'ch': ch,
         'detail': detail,
     })
+
+
+def reset_tracking():
+    """Wipe the latched state. Caller holds LOCK."""
+    EVENTS.clear()
+    STATE['glitches'] = 0
+    STATE['lo'] = STATE['hi'] = None
+    STATE['count'] = 0
+    STATE['started'] = time.time()
+    for dq in HIST.values():
+        dq.clear()
+    BTN.clear()
+    STATE['btn_init'] = False
+    STATE['size_warn'] = None
+    HAT['value'] = None
+    HAT['ever'] = set()
+
+
+def install_layout(layout):
+    """Adopt a freshly parsed layout. Caller holds LOCK."""
+    global LAYOUT
+    LAYOUT = layout
+    HIST.clear()
+    for ax in layout['axes']:
+        HIST[ax['name']] = collections.deque(maxlen=HIST_LEN)
+
+
+def axis_value(rep, ax):
+    """Decode one axis out of a report, or None if the report is too short."""
+    i = ax['byte']
+    if ax['bits'] == 16:
+        if len(rep) <= i + 1:
+            return None
+        return rep[i] | (rep[i + 1] << 8)
+    if len(rep) <= i:
+        return None
+    val = rep[i]
+    return val - 256 if ax['signed'] and val > 127 else val
+
+
+def button_mask(rep, spec):
+    """The button bits as one integer, bit 0 = lowest-numbered button."""
+    need = (spec['first_bit'] + spec['count'] + 7) // 8
+    if len(rep) < need:
+        return 0
+    whole = int.from_bytes(bytes(rep[:need]), 'little')
+    return (whole >> spec['first_bit']) & ((1 << spec['count']) - 1)
+
+
+def decode_vendor(rep):
+    """Firmware version / wheel id / pedal presence out of the vendor block.
+
+    Mirrors ftecff_raw_event() in hid-ftecff.c, shifted by one: the driver
+    expects a NUMBERED 34-byte report (data[0] == 0x01) while this base sends
+    33 bytes with no report id, which is exactly why its sysfs wheel_id,
+    fw_version and tuning values all stay 0.
+    """
+    out = {}
+    if len(rep) != 33:
+        # these offsets are only meaningful for this base's report shape
+        return out
+    if rep[29] == 0xff:
+        if rep[30] == 0x04:
+            out['pedals'] = bool(rep[31] & 0x0f)
+            out['handbrake'] = bool(rep[31] >> 4 & 0x0f)
+    else:
+        out['wheel_id'] = rep[30]
+        out['fw_version'] = rep[31] | (rep[32] << 8)
+    return out
+
+
+def note_buttons(mask, spec, now):
+    """Latch button state; log presses, and log a first-ever press loudly."""
+    # A bit that was already high in the very first report we saw was never
+    # observed going down, which is what "stuck on" means. Distinguish that from
+    # a button the user is simply holding, which we watched go down.
+    first_report = not STATE['btn_init']
+    STATE['btn_init'] = True
+    first = spec['first_usage']
+    for i in range(spec['count']):
+        num = first + i
+        on = bool(mask >> i & 1)
+        rec = BTN.get(num)
+        if rec is None:
+            rec = BTN[num] = {'on': False, 'ever': False, 'count': 0,
+                              'last': None, 'from_start': False}
+        if on and first_report:
+            rec['from_start'] = True
+        if on == rec['on']:
+            continue
+        rec['on'] = on
+        if on:
+            rec['count'] += 1
+            rec['last'] = now
+            label = BTN_FN.get(num, '')
+            if not rec['ever']:
+                rec['ever'] = True
+                event('BTN-NEW', f'btn {num}',
+                      f'first press seen{" - " + label if label else ""}')
+            else:
+                event('BTN', f'btn {num}', f'pressed{" - " + label if label else ""}')
 
 
 def reader():
@@ -68,11 +227,13 @@ def reader():
     last_t = time.time()
     tick_t = time.time()
     tick_n = 0
+    prev_mask = None
 
     while True:
         try:
-            path = os.path.realpath(
-                glob.glob('/dev/input/by-id/usb-Fanatec_*-hidraw')[0])
+            node = glob.glob('/dev/input/by-id/usb-Fanatec_*-hidraw')[0]
+            path = os.path.realpath(node)
+            layout = hid_layout.layout_for(node)
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         except (IndexError, OSError) as exc:
             with LOCK:
@@ -84,6 +245,10 @@ def reader():
         with LOCK:
             STATE['dev'] = path
             STATE['connected'] = True
+            install_layout(layout)
+        prev.clear()
+        railed.clear()
+        prev_mask = None
 
         try:
             while True:
@@ -127,6 +292,10 @@ def reader():
                         STATE['count'] += 1
                         STATE['report'] = rep
                         STATE['size'] = len(rep)
+                        if len(rep) != LAYOUT['size']:
+                            STATE['size_warn'] = (
+                                f'report is {len(rep)} bytes but the descriptor '
+                                f'declares {LAYOUT["size"]} - offsets may be wrong')
                         if STATE['lo'] is None or len(STATE['lo']) != len(rep):
                             STATE['lo'] = list(rep)
                             STATE['hi'] = list(rep)
@@ -137,24 +306,51 @@ def reader():
                                 if b > STATE['hi'][i]:
                                     STATE['hi'][i] = b
 
-                        for name, idx in CHANNELS:
-                            if len(rep) <= idx + 1:
+                        for ax in LAYOUT['axes']:
+                            val = axis_value(rep, ax)
+                            if val is None:
                                 continue
-                            val = rep[idx] | (rep[idx + 1] << 8)
+                            name = ax['name']
                             HIST[name].append((now, val))
 
                             old = prev.get(name)
-                            if old is not None and abs(val - old) > JUMP:
+                            if (ax['bits'] == 16 and old is not None
+                                    and abs(val - old) > JUMP):
                                 event('JUMP', name, f'{old} -> {val}  (D{val-old:+})')
                             prev[name] = val
 
                             # only log ENTERING a rail; a channel that simply
                             # rests at a rail must not spam the log
-                            at_rail = val in (0, 65535)
+                            at_rail = ax['bits'] == 16 and val in (0, 65535)
                             if name in railed and at_rail and not railed[name]:
                                 event('RAIL', name,
                                       'went to ' + ('MAX 65535' if val else 'MIN 0'))
                             railed[name] = at_rail
+
+                        spec = LAYOUT['buttons']
+                        if spec:
+                            mask = button_mask(rep, spec)
+                            if mask != prev_mask:
+                                note_buttons(mask, spec, now)
+                                prev_mask = mask
+
+                        hat = LAYOUT['hat']
+                        if hat and len(rep) > hat['byte']:
+                            hv = (rep[hat['byte']] >> hat['shift']) & 0x0f
+                            if hv != HAT['value']:
+                                HAT['value'] = hv
+                                if hv not in HAT['ever'] and hv <= hat['lmax']:
+                                    HAT['ever'].add(hv)
+                                    event('HAT', 'hat',
+                                          f'first {HAT_DIRS[hv]} seen (raw {hv})')
+
+                        if LAYOUT['spare_bits']:
+                            lo_b = LAYOUT['spare_bits'][0] // 8
+                            hi_b = LAYOUT['spare_bits'][-1] // 8
+                            STATE['spare'] = list(rep[lo_b:hi_b + 1])
+
+                        for key, val in decode_vendor(rep).items():
+                            STATE[key] = val
         finally:
             try:
                 os.close(fd)
@@ -182,6 +378,9 @@ def snapshot():
     with LOCK:
         rep = STATE['report']
         lo, hi = STATE['lo'], STATE['hi']
+        warnings = list(LAYOUT['warnings'])
+        if STATE['size_warn']:
+            warnings.append(STATE['size_warn'])
         out = {
             'dev': STATE['dev'],
             'connected': STATE['connected'],
@@ -190,83 +389,172 @@ def snapshot():
             'size': STATE['size'],
             'uptime': round(now - STATE['started'], 1),
             'glitches': STATE['glitches'],
-            'events': list(EVENTS)[:60],
+            'events': list(EVENTS)[:80],
             'hex': ' '.join(f'{b:02x}' for b in rep) if rep else '',
-            'channels': [],
+            'layout_src': LAYOUT['source'],
+            'warnings': warnings,
+            'fw_version': STATE['fw_version'],
+            'wheel_id': STATE['wheel_id'],
+            'pedals': STATE['pedals'],
+            'handbrake': STATE['handbrake'],
+            'spare': STATE['spare'],
+            'axes': [],
+            'motion': [],
+            'buttons': [],
+            'btn_seen': [],
+            'hat': None,
             'bytes': [],
-            'candidates': [],
+            'undecoded': [],
         }
 
-        for name, idx in CHANNELS:
-            pts = list(HIST[name])
+        for ax in LAYOUT['axes']:
+            pts = list(HIST.get(ax['name'], ()))
             recent = [v for t, v in pts if now - t <= WINDOW]
             vals = [v for _, v in pts]
+            wide = ax['bits'] == 16
             ch = {
-                'name': name,
-                'byte': idx,
+                'name': ax['name'],
+                'hid': ax['hid'],
+                'byte': ax['byte'],
+                'bits': ax['bits'],
+                'lmin': ax['lmin'],
+                'lmax': ax['lmax'],
                 'value': vals[-1] if vals else None,
-                'volts': round(vals[-1] / 65535 * 3.3, 3) if vals else None,
+                'volts': (round(vals[-1] / 65535 * 3.3, 3)
+                          if vals and ax['name'] in VOLT_CHANNELS else None),
                 'min': min(vals) if vals else None,
                 'max': max(vals) if vals else None,
                 'span': (max(vals) - min(vals)) if vals else 0,
                 'jitter_sd': round(statistics.pstdev(recent), 1) if len(recent) > 1 else 0.0,
                 'jitter_rev': reversals(recent) if len(recent) > 1 else 0,
                 'n_recent': len(recent),
-                'spark': vals[-240:],
+                'spark': vals[-SPARK:],
             }
-            ch['span_pct'] = round(100.0 * ch['span'] / 65535, 1)
+            full = ax['lmax'] - ax['lmin']
+            ch['span_pct'] = round(100.0 * ch['span'] / full, 1) if full else 0.0
             # normalised so it is comparable across report rates
             ch['rev_per100'] = (round(100.0 * ch['jitter_rev'] / len(recent), 1)
                                 if len(recent) > 1 else 0.0)
-            ch['warn'] = ch['jitter_sd'] > SD_WARN
-            out['channels'].append(ch)
+            ch['warn'] = wide and ch['jitter_sd'] > SD_WARN
+            ch['idle'] = not vals or ch['span'] == 0
+            out['axes'].append(ch)
 
+            # Motion attribution: what actually responded in the last WINDOW.
+            # Wiggle one control and only that control should appear here - this
+            # is how you tell a real cross-channel link from a sparkline that
+            # merely auto-scaled some resting LSB dither into a big wiggle.
+            if len(recent) > 1:
+                move = max(recent) - min(recent)
+                floor = MOTION_MIN16 if wide else MOTION_MIN8
+                if move >= floor:
+                    out['motion'].append({
+                        'name': ax['name'], 'byte': ax['byte'], 'move': move,
+                        'pct': round(100.0 * move / full, 1) if full else 0.0,
+                    })
+        out['motion'].sort(key=lambda m: -m['pct'])
+
+        spec = LAYOUT['buttons']
+        if spec:
+            for i in range(spec['count']):
+                num = spec['first_usage'] + i
+                rec = BTN.get(num)
+                bit = spec['first_bit'] + i
+                out['buttons'].append({
+                    'n': num,
+                    'byte': bit // 8,
+                    'bit': bit % 8,
+                    'fn': BTN_FN.get(num, ''),
+                    'on': bool(rec and rec['on']),
+                    'ever': bool(rec and rec['ever']),
+                    'count': rec['count'] if rec else 0,
+                    # high since the first report we ever saw, i.e. never
+                    # observed going down -> likely shorted
+                    'stuck': bool(rec and rec['on'] and rec['from_start']),
+                })
+            out['btn_seen'] = [b['n'] for b in out['buttons'] if b['ever']]
+
+        if LAYOUT['hat']:
+            out['hat'] = {
+                'value': HAT['value'],
+                'dir': (HAT_DIRS[HAT['value']]
+                        if HAT['value'] is not None and HAT['value'] < 8 else 'centre'),
+                'ever': sorted(HAT['ever']),
+                'byte': LAYOUT['hat']['byte'],
+            }
+
+        labels = byte_labels(LAYOUT)
         if lo and hi:
             for i in range(len(lo)):
                 out['bytes'].append({
                     'i': i, 'lo': lo[i], 'hi': hi[i],
                     'now': rep[i] if rep and i < len(rep) else 0,
                     'moved': hi[i] != lo[i],
-                    'known': i in KNOWN_BYTES,
+                    'label': labels.get(i, 'undecoded'),
+                    'known': i in labels,
                 })
-            moved = [i for i in range(len(lo)) if hi[i] != lo[i] and i not in KNOWN_BYTES]
-            seen = set()
-            for i in moved:
-                if i in seen or i + 1 not in moved:
-                    continue
-                seen.update((i, i + 1))
-                out['candidates'].append({
-                    'lo_byte': i,
-                    'range': f'{lo[i] | (lo[i+1] << 8)} .. {hi[i] | (hi[i+1] << 8)}',
-                })
+            out['undecoded'] = [i for i in range(len(lo))
+                                if hi[i] != lo[i] and i not in labels]
     return out
+
+
+def byte_labels(layout):
+    """byte index -> what the descriptor says lives there."""
+    labels = {}
+    spec = layout['buttons']
+    if spec:
+        first, last = spec['first_bit'], spec['first_bit'] + spec['count'] - 1
+        for b in range(first // 8, last // 8 + 1):
+            labels[b] = 'buttons'
+    for bit in layout['spare_bits']:
+        labels.setdefault(bit // 8, 'spare button bits')
+    if layout['hat']:
+        b = layout['hat']['byte']
+        labels[b] = ('hat + ' + labels[b]) if b in labels else 'hat'
+    for ax in layout['axes']:
+        for k in range(ax['bits'] // 8):
+            labels[ax['byte'] + k] = ax['name']
+    for b in layout['vendor']:
+        labels[b] = 'vendor'
+    return labels
 
 
 PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fanatec pedal diagnostics</title>
+<title>Fanatec wheel/pedal diagnostics</title>
 <style>
   :root { color-scheme: dark; }
   body { margin:0; padding:14px; background:#101216; color:#dfe4ec;
          font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
   h1 { font-size:15px; margin:0 0 10px; color:#9aa6b8; font-weight:600;
        letter-spacing:.06em; text-transform:uppercase; }
-  h2 { font-size:12px; margin:20px 0 8px; color:#7d8798; font-weight:600;
+  h2 { font-size:12px; margin:22px 0 8px; color:#7d8798; font-weight:600;
        letter-spacing:.08em; text-transform:uppercase; }
-  #banner { padding:10px 12px; border-radius:6px; margin-bottom:14px;
+  #banner { padding:10px 12px; border-radius:6px; margin-bottom:10px;
             background:#16351f; border:1px solid #2c6b3f; color:#7fe0a0; }
   #banner.bad { background:#3a1518; border-color:#7d2b31; color:#ff9aa2; }
   #banner.idle { background:#3a2f13; border-color:#7d6425; color:#ffd58a; }
+  #warn { padding:8px 12px; border-radius:6px; margin-bottom:10px;
+          background:#3a2f13; border:1px solid #7d6425; color:#ffd58a;
+          display:none; }
+  #info { color:#8b95a6; font-size:12px; margin-bottom:12px; }
   .grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); }
+  .grid.sm { grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
   .card { background:#171a20; border:1px solid #262b34; border-radius:8px; padding:12px; }
   .card.warn { border-color:#7d2b31; }
+  .card.idle { border-style:dashed; border-color:#39414f; }
   .nm { color:#8b95a6; font-size:12px; letter-spacing:.08em; }
   .big { font-size:30px; font-variant-numeric:tabular-nums; margin:2px 0; }
+  .big.sm2 { font-size:22px; }
   .sub { color:#8b95a6; font-size:12px; }
+  .tiny { color:#5f6878; font-size:11px; }
   .hot { color:#ff9aa2; }
   .ok  { color:#7fe0a0; }
-  canvas { width:100%; height:52px; display:block; margin-top:8px;
+  .bar { height:8px; background:#0d0f13; border-radius:4px; margin:7px 0 3px;
+         position:relative; overflow:hidden; }
+  .bar > i { position:absolute; top:0; bottom:0; background:#3d7fbf; }
+  .bar > u { position:absolute; top:0; bottom:0; background:#2a3a4a; }
+  canvas { width:100%; height:52px; display:block; margin-top:6px;
            background:#0d0f13; border-radius:4px; }
   table { border-collapse:collapse; width:100%; font-size:12px; }
   td,th { padding:3px 8px; text-align:left; border-bottom:1px solid #21252d; }
@@ -276,24 +564,57 @@ PAGE = """<!doctype html>
        font-size:11px; min-width:34px; text-align:center; }
   .b.moved { background:#3a2a12; color:#ffcc7a; }
   .b.moved.known { background:#12303a; color:#7ad4ee; }
+  #btns { display:flex; flex-wrap:wrap; gap:3px; }
+  .k { padding:4px 0; border-radius:3px; background:#161a20; color:#4b5462;
+       font-size:11px; width:30px; text-align:center; border:1px solid #1d222a; }
+  .k.ever { background:#12303a; color:#7ad4ee; border-color:#1d4a5a; }
+  .k.on { background:#7fe0a0; color:#0d1a12; border-color:#7fe0a0; font-weight:700; }
+  .k.stuck { background:#3a1518; color:#ff9aa2; border-color:#7d2b31; }
+  #hatgrid { display:grid; grid-template-columns:repeat(3,34px); gap:3px; }
+  .h { height:26px; border-radius:3px; background:#161a20; border:1px solid #1d222a;
+       color:#4b5462; font-size:10px; display:flex; align-items:center;
+       justify-content:center; }
+  .h.ever { background:#12303a; color:#7ad4ee; border-color:#1d4a5a; }
+  .h.on { background:#7fe0a0; color:#0d1a12; font-weight:700; }
   button { background:#242a34; color:#dfe4ec; border:1px solid #39414f;
            border-radius:5px; padding:6px 14px; font:inherit; cursor:pointer; }
   button:hover { background:#2e3542; }
   .hex { word-break:break-all; color:#6f7a8c; font-size:11px; }
+  #motion { font-size:13px; }
+  #motion .row { display:flex; gap:10px; align-items:baseline; }
+  #motion .nmw { min-width:110px; color:#7ad4ee; }
 </style>
 
-<h1>Fanatec pedal diagnostics</h1>
+<h1>Fanatec wheel/pedal diagnostics</h1>
 <div id="banner">waiting for data...</div>
+<div id="warn"></div>
+<div id="info"></div>
 <button onclick="reset()">reset stats &amp; event log</button>
 
-<h2>Channels</h2>
+<h2>Live motion <span class="sub">(what changed in the last 2 s)</span></h2>
+<div id="motion" class="sub">nothing moving</div>
+
+<h2>Analog axes</h2>
 <div class="grid" id="chans"></div>
+
+<h2>Rim analog <span class="sub">(ministick, slider, dial)</span></h2>
+<div class="grid sm" id="aux"></div>
+
+<h2>Hat switch <span class="sub">(blue = seen since reset, green = now)</span></h2>
+<div id="hatgrid"></div>
+<div id="hatsub" class="sub" style="margin-top:6px"></div>
+
+<h2>Buttons <span class="sub">(grey = never seen, blue = seen, green = down,
+   red = stuck on)</span></h2>
+<div id="btns"></div>
+<div id="btnsub" class="sub" style="margin-top:8px"></div>
 
 <h2>Event log <span class="sub">(latched - survives until reset)</span></h2>
 <table><thead><tr><th>t+s</th><th>kind</th><th>ch</th><th>detail</th></tr></thead>
 <tbody id="events"></tbody></table>
 
-<h2>Report bytes <span class="sub">(orange = moved, blue = known channel)</span></h2>
+<h2>Report bytes <span class="sub">(blue = moved and decoded, orange = moved but
+   undecoded)</span></h2>
 <div class="bytes" id="bytes"></div>
 <div id="cands" class="sub" style="margin-top:8px"></div>
 <div class="hex" id="hex" style="margin-top:8px"></div>
@@ -308,7 +629,7 @@ function spark(cv, vals) {
   g.clearRect(0, 0, w, h);
   if (!vals || vals.length < 2) return;
   let lo = Math.min(...vals), hi = Math.max(...vals);
-  if (hi - lo < 400) { const m = (hi + lo) / 2; lo = m - 200; hi = m + 200; }
+  if (hi === lo) { lo -= 1; hi += 1; }
   g.strokeStyle = '#5fb0ff'; g.lineWidth = 1.5; g.beginPath();
   vals.forEach((v, i) => {
     const x = i / (vals.length - 1) * w;
@@ -317,6 +638,60 @@ function spark(cv, vals) {
   });
   g.stroke();
 }
+
+// The sparkline auto-scales, so a channel resting with +-30 LSB of ADC dither
+// draws the same dramatic wiggle as a real sweep. Always print the y-range
+// next to it, and show an absolute full-scale bar, so it cannot mislead.
+function axisCard(el, c, small) {
+  const twitchy = c.warn;
+  el.className = 'card' + (twitchy ? ' warn' : '') + (c.idle ? ' idle' : '');
+  el.querySelector('.nm').textContent =
+    c.name + '   ' + c.hid + ' @ byte ' + c.byte + (c.bits === 16 ? '' : ' (8-bit)');
+  el.querySelector('.big').textContent =
+    (c.value === null ? '--' : c.value) + (c.volts !== null ? '  ~' + c.volts + 'V' : '');
+  const full = c.lmax - c.lmin;
+  const bar = el.querySelector('.bar');
+  const pos = c.value === null ? 0 : (c.value - c.lmin) / full * 100;
+  const seenLo = c.min === null ? 0 : (c.min - c.lmin) / full * 100;
+  const seenW = c.min === null ? 0 : (c.max - c.min) / full * 100;
+  bar.querySelector('u').style.left = seenLo + '%';
+  bar.querySelector('u').style.width = seenW + '%';
+  bar.querySelector('i').style.left = Math.max(0, pos - 0.6) + '%';
+  bar.querySelector('i').style.width = '1.5%';
+  el.querySelector('.s1').textContent = c.idle
+    ? 'no movement seen since reset  (rests at ' + c.value + ')'
+    : 'seen ' + c.min + ' .. ' + c.max + '   span ' + c.span + ' (' + c.span_pct + '%)';
+  el.querySelector('.s2').innerHTML = small ? '' :
+    'noise/2s: sd <span class="' + (twitchy ? 'hot' : 'ok') + '">'
+    + c.jitter_sd + '</span>, ' + c.rev_per100 + ' reversals/100'
+    + ' <span class="tiny">(' + c.n_recent + ' samples)</span>';
+  spark(el.querySelector('canvas'), c.spark);
+  const sp = c.spark || [];
+  el.querySelector('.s3').textContent = sp.length > 1
+    ? 'graph y-range ' + Math.min(...sp) + ' .. ' + Math.max(...sp)
+      + '  (auto-scaled, span ' + (Math.max(...sp) - Math.min(...sp)) + ')'
+    : 'graph: not enough samples';
+}
+
+function fill(host, list, small) {
+  list.forEach((c, i) => {
+    let el = host.children[i];
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'card';
+      el.innerHTML = '<div class="nm"></div><div class="big' + (small ? ' sm2' : '')
+                   + '"></div><div class="bar"><u></u><i></i></div>'
+                   + '<div class="sub s1"></div><div class="sub s2"></div>'
+                   + '<canvas></canvas><div class="tiny s3"></div>';
+      host.appendChild(el);
+    }
+    axisCard(el, c, small);
+  });
+  while (host.children.length > list.length) host.lastChild.remove();
+}
+
+const HAT_CELLS = [7, 0, 1, 6, null, 2, 5, 4, 3];   // NW N NE / W - E / SW S SE
+const HAT_NAME = ['N','NE','E','SE','S','SW','W','NW'];
 
 async function tick() {
   let d;
@@ -330,7 +705,8 @@ async function tick() {
   } else if (d.count === 0) {
     b.className = 'idle';
     b.textContent = 'device node is open (' + d.dev + ') but the base is sending '
-                  + 'NO reports. Is the wheel base powered on? '
+                  + 'NO reports. Check the base is powered on and out of standby '
+                  + '- it sends nothing at all when it is off. '
                   + '(' + d.uptime + 's waiting)';
   } else if (d.glitches > 0) {
     b.className = 'bad';
@@ -342,30 +718,57 @@ async function tick() {
                   + d.count + ' reports, ' + d.uptime + 's up';
   }
 
-  const host = document.getElementById('chans');
-  d.channels.forEach((c, i) => {
-    let el = host.children[i];
-    if (!el) {
-      el = document.createElement('div');
-      el.className = 'card';
-      el.innerHTML = '<div class="nm"></div><div class="big"></div>'
-                   + '<div class="sub s1"></div><div class="sub s2"></div>'
-                   + '<canvas></canvas>';
-      host.appendChild(el);
-    }
-    const twitchy = c.warn;
-    el.className = 'card' + (twitchy ? ' warn' : '');
-    el.querySelector('.nm').textContent = c.name + '  [byte ' + c.byte + ']';
-    el.querySelector('.big').textContent =
-      (c.value === null ? '--' : c.value) + '  ~' + c.volts + 'V';
-    el.querySelector('.s1').textContent =
-      'seen ' + c.min + ' .. ' + c.max + '   span ' + c.span + ' (' + c.span_pct + '%)';
-    el.querySelector('.s2').innerHTML =
-      'noise/2s: sd <span class="' + (twitchy ? 'hot' : 'ok') + '">'
-      + c.jitter_sd + '</span>, ' + c.rev_per100 + ' reversals/100'
-      + ' <span style="color:#5f6878">(' + c.n_recent + ' samples)</span>';
-    spark(el.querySelector('canvas'), c.spark);
-  });
+  const w = document.getElementById('warn');
+  w.style.display = d.warnings.length ? 'block' : 'none';
+  w.innerHTML = d.warnings.map(x => 'LAYOUT WARNING: ' + x).join('<br>');
+
+  const bits = [];
+  bits.push('layout from ' + d.layout_src);
+  bits.push('report ' + d.size + ' B');
+  if (d.fw_version !== null) bits.push('fw ' + d.fw_version);
+  if (d.wheel_id !== null)
+    bits.push('wheel_id 0x' + d.wheel_id.toString(16).padStart(2, '0'));
+  if (d.pedals !== null) bits.push('pedals ' + (d.pedals ? 'connected' : 'NOT connected'));
+  if (d.handbrake !== null) bits.push('handbrake ' + (d.handbrake ? 'connected' : 'no'));
+  if (d.spare) bits.push('spare bits ' + d.spare.map(x =>
+      '0x' + x.toString(16).padStart(2, '0')).join(' '));
+  document.getElementById('info').textContent = bits.join('   |   ');
+
+  const wide = d.axes.filter(a => a.bits === 16);
+  const narrow = d.axes.filter(a => a.bits !== 16);
+  fill(document.getElementById('chans'), wide, false);
+  fill(document.getElementById('aux'), narrow, true);
+
+  document.getElementById('motion').innerHTML = d.motion.length
+    ? d.motion.map(m => '<div class="row"><span class="nmw">' + m.name
+        + '</span><span>moved ' + m.move + '  (' + m.pct
+        + '% of range, byte ' + m.byte + ')</span></div>').join('')
+    : '<span class="sub">nothing moving</span>';
+
+  if (d.hat) {
+    document.getElementById('hatgrid').innerHTML = HAT_CELLS.map(v => {
+      if (v === null) return '<div class="h">--</div>';
+      const on = d.hat.value === v;
+      const ever = d.hat.ever.includes(v);
+      return '<div class="h' + (on ? ' on' : ever ? ' ever' : '') + '">'
+             + HAT_NAME[v] + '</div>';
+    }).join('');
+    document.getElementById('hatsub').textContent =
+      'raw ' + d.hat.value + ' (' + d.hat.dir + ') at byte ' + d.hat.byte
+      + ' low nibble   |   directions seen: '
+      + (d.hat.ever.length ? d.hat.ever.map(v => HAT_NAME[v]).join(' ') : 'none');
+  }
+
+  document.getElementById('btns').innerHTML = d.buttons.map(x =>
+    '<div class="k' + (x.stuck ? ' stuck' : x.on ? ' on' : x.ever ? ' ever' : '')
+    + '" title="button ' + x.n + (x.fn ? ' - ' + x.fn : '')
+    + '  [byte ' + x.byte + ' bit ' + x.bit + ']  presses: ' + x.count + '">'
+    + x.n + '</div>').join('');
+  const seen = d.btn_seen;
+  document.getElementById('btnsub').textContent =
+    'seen ' + seen.length + ' of ' + d.buttons.length + ': '
+    + (seen.length ? seen.join(', ') : 'none yet')
+    + '   |   hover a cell for its rim function and report bit';
 
   document.getElementById('events').innerHTML = d.events.length
     ? d.events.map(e =>
@@ -375,12 +778,12 @@ async function tick() {
 
   document.getElementById('bytes').innerHTML = d.bytes.map(x =>
     '<div class="b' + (x.moved ? ' moved' : '') + (x.known ? ' known' : '')
-    + '" title="byte ' + x.i + ': seen ' + x.lo + '-' + x.hi + '">'
+    + '" title="byte ' + x.i + ' (' + x.label + '): seen ' + x.lo + '-' + x.hi + '">'
     + x.i + ':' + x.now + '</div>').join('');
 
-  document.getElementById('cands').textContent = d.candidates.length
-    ? 'UNKNOWN 16-bit channels moving: '
-      + d.candidates.map(c => '[' + c.lo_byte + ':' + (c.lo_byte + 1) + '] ' + c.range).join('   ')
+  document.getElementById('cands').textContent = (d.undecoded || []).length
+    ? 'MOVED BUT NOT DECODED: bytes ' + d.undecoded.join(', ')
+      + ' - the descriptor does not claim these; something new is reporting'
     : '';
 
   document.getElementById('hex').textContent = d.hex;
@@ -415,13 +818,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == '/reset':
             with LOCK:
-                EVENTS.clear()
-                STATE['glitches'] = 0
-                STATE['lo'] = STATE['hi'] = None
-                STATE['count'] = 0
-                STATE['started'] = time.time()
-                for dq in HIST.values():
-                    dq.clear()
+                reset_tracking()
             self._send(b'{"ok":true}', 'application/json')
         else:
             self.send_error(404)
