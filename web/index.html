@@ -1,0 +1,63 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fanatec wheel/pedal diagnostics</title>
+<link rel="stylesheet" href="/app.css">
+
+<h1>Fanatec wheel/pedal diagnostics</h1>
+<div id="banner">waiting for data...</div>
+<div id="bannerfix"></div>
+
+<div id="sys">
+  <div id="syshead" onclick="toggleSys()">
+    <span class="dot" id="sysdot"></span>
+    <span id="syssum">checking this machine...</span>
+    <span class="caret" id="syscaret">SHOW</span>
+  </div>
+  <div id="sysbody"></div>
+</div>
+
+<div id="warn"></div>
+<div id="info"></div>
+
+<div id="actions">
+  <button onclick="reset()">reset stats &amp; event log</button>
+  <div id="ffbwrap">
+    <button id="hold" disabled><i class="fillbar"></i><span class="lbl">hold to
+      run FFB test</span></button>
+    <button id="abort" onclick="abortFfb()">ABORT</button>
+    <span id="ffbstat"></span>
+  </div>
+</div>
+<div id="err"></div>
+<div id="ffbres"></div>
+
+<h2>Live motion <span class="sub">(what changed in the last 2 s)</span></h2>
+<div id="motion" class="sub">nothing moving</div>
+
+<h2>Analog axes</h2>
+<div class="grid" id="chans"></div>
+
+<h2>Rim analog <span class="sub">(ministick, slider, dial)</span></h2>
+<div class="grid sm" id="aux"></div>
+
+<h2>Hat switch <span class="sub">(blue = seen since reset, green = now)</span></h2>
+<div id="hatgrid"></div>
+<div id="hatsub" class="sub" style="margin-top:6px"></div>
+
+<h2>Buttons <span class="sub">(grey = never seen, blue = seen, green = down,
+   red = stuck on)</span></h2>
+<div id="btns"></div>
+<div id="btnsub" class="sub" style="margin-top:8px"></div>
+
+<h2>Event log <span class="sub">(latched - survives until reset)</span></h2>
+<table><thead><tr><th>t+s</th><th>kind</th><th>ch</th><th>detail</th></tr></thead>
+<tbody id="events"></tbody></table>
+
+<h2>Report bytes <span class="sub">(blue = moved and decoded, orange = moved but
+   undecoded)</span></h2>
+<div class="bytes" id="bytes"></div>
+<div id="cands" class="sub" style="margin-top:8px"></div>
+<div class="hex" id="hex" style="margin-top:8px"></div>
+
+<script src="/app.js"></script>

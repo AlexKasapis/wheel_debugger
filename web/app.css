@@ -1,0 +1,107 @@
+:root { color-scheme: dark; }
+body { margin:0; padding:14px; background:#101216; color:#dfe4ec;
+       font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+h1 { font-size:15px; margin:0 0 10px; color:#9aa6b8; font-weight:600;
+     letter-spacing:.06em; text-transform:uppercase; }
+h2 { font-size:12px; margin:22px 0 8px; color:#7d8798; font-weight:600;
+     letter-spacing:.08em; text-transform:uppercase; }
+#banner { padding:10px 12px; border-radius:6px; margin-bottom:10px;
+          background:#16351f; border:1px solid #2c6b3f; color:#7fe0a0; }
+#banner.bad { background:#3a1518; border-color:#7d2b31; color:#ff9aa2; }
+#banner.idle { background:#3a2f13; border-color:#7d6425; color:#ffd58a; }
+#warn { padding:8px 12px; border-radius:6px; margin-bottom:10px;
+        background:#3a2f13; border:1px solid #7d6425; color:#ffd58a;
+        display:none; }
+#info { color:#8b95a6; font-size:12px; margin-bottom:12px; }
+.grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); }
+.grid.sm { grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
+.card { background:#171a20; border:1px solid #262b34; border-radius:8px; padding:12px; }
+.card.warn { border-color:#7d2b31; }
+.card.idle { border-style:dashed; border-color:#39414f; }
+.nm { color:#8b95a6; font-size:12px; letter-spacing:.08em; }
+.big { font-size:30px; font-variant-numeric:tabular-nums; margin:2px 0; }
+.big.sm2 { font-size:22px; }
+.sub { color:#8b95a6; font-size:12px; }
+.tiny { color:#5f6878; font-size:11px; }
+.hot { color:#ff9aa2; }
+.ok  { color:#7fe0a0; }
+.bar { height:8px; background:#0d0f13; border-radius:4px; margin:7px 0 3px;
+       position:relative; overflow:hidden; }
+.bar > i { position:absolute; top:0; bottom:0; background:#3d7fbf; }
+.bar > u { position:absolute; top:0; bottom:0; background:#2a3a4a; }
+canvas { width:100%; height:52px; display:block; margin-top:6px;
+         background:#0d0f13; border-radius:4px; }
+table { border-collapse:collapse; width:100%; font-size:12px; }
+td,th { padding:3px 8px; text-align:left; border-bottom:1px solid #21252d; }
+th { color:#7d8798; font-weight:600; }
+.bytes { display:flex; flex-wrap:wrap; gap:3px; }
+.b { padding:3px 5px; border-radius:3px; background:#1b1f26; color:#5f6878;
+     font-size:11px; min-width:34px; text-align:center; }
+.b.moved { background:#3a2a12; color:#ffcc7a; }
+.b.moved.known { background:#12303a; color:#7ad4ee; }
+#btns { display:flex; flex-wrap:wrap; gap:3px; }
+.k { padding:4px 0; border-radius:3px; background:#161a20; color:#4b5462;
+     font-size:11px; width:30px; text-align:center; border:1px solid #1d222a; }
+.k.ever { background:#12303a; color:#7ad4ee; border-color:#1d4a5a; }
+.k.on { background:#7fe0a0; color:#0d1a12; border-color:#7fe0a0; font-weight:700; }
+.k.stuck { background:#3a1518; color:#ff9aa2; border-color:#7d2b31; }
+#hatgrid { display:grid; grid-template-columns:repeat(3,34px); gap:3px; }
+.h { height:26px; border-radius:3px; background:#161a20; border:1px solid #1d222a;
+     color:#4b5462; font-size:10px; display:flex; align-items:center;
+     justify-content:center; }
+.h.ever { background:#12303a; color:#7ad4ee; border-color:#1d4a5a; }
+.h.on { background:#7fe0a0; color:#0d1a12; font-weight:700; }
+button { background:#242a34; color:#dfe4ec; border:1px solid #39414f;
+         border-radius:5px; padding:6px 14px; font:inherit; cursor:pointer; }
+button:hover { background:#2e3542; }
+.hex { word-break:break-all; color:#6f7a8c; font-size:11px; }
+#motion { font-size:13px; }
+#motion .row { display:flex; gap:10px; align-items:baseline; }
+#motion .nmw { min-width:110px; color:#7ad4ee; }
+
+/* ---- system checks -------------------------------------------------- */
+/* Dots are round to keep them apart from the button grid, which uses the
+   same colours for a different meaning. */
+#sys { border:1px solid #262b34; border-radius:6px; background:#141821;
+       margin-bottom:10px; }
+#syshead { display:flex; gap:10px; align-items:center; padding:9px 12px;
+           cursor:pointer; user-select:none; }
+#syshead .caret { color:#5f6878; font-size:10px; margin-left:auto; }
+#sysbody { display:none; border-top:1px solid #21252d; }
+#sys.open #sysbody { display:block; }
+.dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto;
+       background:#5f6878; }
+.dot.ok { background:#4a9d68; }
+.dot.warn { background:#c79a3a; }
+.dot.bad { background:#c4505a; }
+.chk { display:flex; gap:10px; padding:8px 12px;
+       border-bottom:1px solid #1b1f26; }
+.chk:last-child { border-bottom:none; }
+.chk .dot { margin-top:5px; }
+.chk .lab { flex:0 0 108px; color:#9aa6b8; font-size:12px; }
+.chk .det { flex:1 1 220px; min-width:0; }
+.chk .why { color:#5f6878; font-size:11px; margin-top:3px; }
+/* user-select:all, not navigator.clipboard, which needs a secure context and
+   so does nothing over http on the LAN - i.e. on the phone beside the rig. */
+.fix { display:block; margin-top:6px; padding:5px 8px; border-radius:4px;
+       background:#0d0f13; border:1px solid #2a313c; color:#7ad4ee;
+       font-size:11.5px; word-break:break-all;
+       user-select:all; -webkit-user-select:all; }
+
+/* ---- actions -------------------------------------------------------- */
+#actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+           margin-bottom:4px; }
+#ffbwrap { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+           flex:1 1 auto; }
+#hold { position:relative; overflow:hidden; border-color:#7d2b31;
+        touch-action:none; }
+#hold[disabled] { opacity:.45; cursor:not-allowed; border-color:#39414f; }
+#hold .fillbar { position:absolute; inset:0 auto 0 0; width:0;
+                 background:#7d2b31; }
+#hold .lbl { position:relative; }
+#abort { border-color:#7d2b31; color:#ff9aa2; display:none; }
+#ffbstat { font-size:12px; color:#8b95a6; }
+#ffbres { font-size:12px; }
+#ffbres .nmw { display:inline-block; min-width:56px; color:#7ad4ee; }
+#err { color:#ff9aa2; font-size:12px; min-height:16px; }
+#bannerfix:not(:empty) { margin:-4px 0 10px; }
