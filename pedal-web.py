@@ -445,10 +445,12 @@ if __name__ == '__main__':
     threading.Thread(target=reader, daemon=True).start()
     srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
     ip = lan_ip()
-    print(f'  local:  http://localhost:{PORT}')
+    # flush explicitly: stdout is block-buffered when this is redirected or
+    # backgrounded, which would hide the URLs until the process exits
+    print(f'  local:  http://localhost:{PORT}', flush=True)
     if ip:
-        print(f'  phone:  http://{ip}:{PORT}')
-    print('\n  Ctrl-C to stop')
+        print(f'  phone:  http://{ip}:{PORT}', flush=True)
+    print('\n  Ctrl-C to stop', flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
