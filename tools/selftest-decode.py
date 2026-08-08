@@ -2,15 +2,17 @@
 """Self-test for the dashboard - runs with the base powered OFF.
 
 Replays the reports archived in data/raw-pedal-map.log through hid_layout.py,
-sysstate.py and pedal-web.py's decoders and asserts the result, so a decoder can
+decode.py, tracker.py and sysstate.py and asserts the result, so a decoder can
 be changed without sitting at the rig to find out what broke. The layout comes
 from the device's descriptor if hidraw is readable, else from the fallback.
+
+Reports go in through Tracker.ingest(), the same call the reader thread makes,
+so this exercises the production path rather than a copy of it.
 
 Nothing here opens a device for I/O and nothing here can move the wheel.
 
 Run:  python3 tools/selftest-decode.py
 """
-import importlib.util
 import json
 import os
 import sys
@@ -23,15 +25,7 @@ import decode                                              # noqa: E402
 import ffb                                                 # noqa: E402
 import hid_layout                                          # noqa: E402
 import sysstate                                            # noqa: E402
-
-def _load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-pw = _load('pedal_web', os.path.join(ROOT, 'pedal-web.py'))
+import tracker                                             # noqa: E402
 
 FAILS = []
 
@@ -150,14 +144,16 @@ def main():
        sorted({b // 8 for b in layout['spare_bits']}), [14, 15])
 
     print('\n[6] full pipeline: synthesised clutch sweep + gear-up + hat')
-    pw.install_layout(layout)
-    pw.reset_tracking()
+    # Reports go in through the same call the reader thread makes, so this
+    # exercises the shipping path instead of a second copy of it.
+    track = tracker.Tracker(layout)
     now = time.time()
+    clutch = by['CLUTCH']['byte']
     sweep = list(range(65535, 20000, -4000))
     stream = [STEER_PHASE] * 4
     for val in sweep:
         rep = bytearray(STEER_PHASE)
-        rep[22], rep[23] = val & 0xff, val >> 8
+        rep[clutch], rep[clutch + 1] = val & 0xff, val >> 8
         stream.append(bytes(rep))
     gear = bytearray(STEER_PHASE)
     gear[1] |= 0x01                                  # button 5 = GEAR UP
@@ -168,29 +164,9 @@ def main():
     stream.append(bytes(hat))
 
     for rep in stream:
-        pw.STATE['count'] += 1
-        pw.STATE['report'] = rep
-        pw.STATE['size'] = len(rep)
-        if pw.STATE['lo'] is None:
-            pw.STATE['lo'], pw.STATE['hi'] = list(rep), list(rep)
-        else:
-            for i, b in enumerate(rep):
-                pw.STATE['lo'][i] = min(pw.STATE['lo'][i], b)
-                pw.STATE['hi'][i] = max(pw.STATE['hi'][i], b)
-        for ax in layout['axes']:
-            val = decode.axis_value(rep, ax)
-            if val is not None:
-                pw.note_axis(ax['name'], val, now)
-        pw.note_buttons(decode.button_mask(rep, spec), spec, now)
-        hv = rep[layout['hat']['byte']] >> layout['hat']['shift'] & 0x0f
-        if hv != pw.HAT['value']:
-            pw.HAT['value'] = hv
-            if hv <= layout['hat']['lmax']:
-                pw.HAT['ever'].add(hv)
-        for key, val in decode.decode_vendor(rep).items():
-            pw.STATE[key] = val
+        track.ingest(rep, now)
 
-    snap = pw.snapshot()
+    snap = track.snapshot()
     axes = {a['name']: a for a in snap['axes']}
     ck('CLUTCH no longer flagged idle', axes['CLUTCH']['idle'], False)
     ck('CLUTCH span', axes['CLUTCH']['span'], max(sweep) - min(sweep))
@@ -216,71 +192,81 @@ def main():
 
     # The latch must outlive the rolling sparkline window, or a channel that
     # demonstrably worked reads as dead once HIST_LEN further reports arrive.
-    pw.reset_tracking()
-    pw.install_layout(layout)
-    brake = next(a for a in layout['axes'] if a['name'] == 'BRAKE')
+    track = tracker.Tracker(layout)
+    brake = by['BRAKE']
     rest = decode.axis_value(STEER_PHASE, brake)
     pressed = bytearray(STEER_PHASE)
     pressed[brake['byte']], pressed[brake['byte'] + 1] = 0x39, 0x30   # 12345
-    for rep in (bytes(pressed),) + (STEER_PHASE,) * (pw.HIST_LEN + 50):
-        pw.STATE['count'] += 1
-        pw.STATE['report'] = rep
-        for ax in layout['axes']:
-            pw.note_axis(ax['name'], decode.axis_value(rep, ax), now)
-    pw.STATE['lo'] = pw.STATE['hi'] = list(STEER_PHASE)
-    aged = {a['name']: a for a in pw.snapshot()['axes']}['BRAKE']
+    for rep in (bytes(pressed),) + (STEER_PHASE,) * (tracker.HIST_LEN + 50):
+        track.ingest(rep, now)
+    aged = {a['name']: a for a in track.snapshot()['axes']}['BRAKE']
     ck('a press that aged out of the sparkline is still latched',
        aged['min'], 12345)
     ck('and the channel is NOT called idle', aged['idle'], False)
     ck('the press is gone from the sparkline, as expected',
        min(aged['spark']), rest)
-    # a truncated report must not seed a [None, None] latch
-    pw.note_axis('BRAKE', None, now)
-    pw.note_axis('BRAKE', 500, now)
-    ck('a short report does not poison the latch', pw.SEEN['BRAKE'][0], 500)
 
-    pw.reset_tracking()
-    pw.install_layout(layout)
-    ck('reset clears the latch', pw.SEEN, {})
+    # A report too short to carry BRAKE must skip it, not seed a [None, None]
+    # latch that crashes the comparison on the next sample.
+    short = tracker.Tracker(layout)
+    short.ingest(STEER_PHASE[:brake['byte']], now)
+    short.ingest(STEER_PHASE, now)
+    ck('a short report does not poison the latch', short.seen['BRAKE'][0], rest)
+
+    track.reset()
+    ck('reset clears the latch', track.seen, {})
 
     # A stream that died must not keep advertising its old rate, or the silence
     # gets blamed on the pedal.
-    pw.STATE['rate'] = 138.5
-    pw.STATE['last_report_t'] = time.time() - 30.0
-    stale = pw.snapshot()
+    track.rate = 138.5
+    track.last_report_t = time.time() - 30.0
+    stale = track.snapshot()
     ck('a dead stream is not called streaming', stale['streaming'], False)
     ck('a dead stream advertises no rate', stale['rate'], 0.0)
     ck('a dead stream reports how long it has been silent',
        stale['silent_for'] >= 29.0, True)
     ck('30s of silence is frozen', stale['frozen'], True)
-    pw.STATE['last_report_t'] = time.time()
-    ck('a live stream keeps its rate', pw.snapshot()['rate'], 138.5)
+    track.last_report_t = time.time()
+    ck('a live stream keeps its rate', track.snapshot()['rate'], 138.5)
 
     # A few seconds of rest is normal here; crying wolf would get the real
     # warning ignored.
-    pw.STATE['last_report_t'] = time.time() - (pw.GAP + 1.0)
-    resting = pw.snapshot()
+    track.last_report_t = time.time() - (tracker.GAP + 1.0)
+    resting = track.snapshot()
     ck('a few seconds of rest is not frozen', resting['frozen'], False)
     ck('but it is honest that no reports are arriving', resting['rate'], 0.0)
 
     # DROPOUT fires whenever the rig sits still, so it must not bury JUMP/RAIL.
-    before = pw.STATE['glitches']
-    pw.event('DROPOUT', '-', 'rig sat still')
-    ck('a dropout is not counted as a glitch', pw.STATE['glitches'], before)
-    pw.event('RAIL', 'BRAKE', 'went to MAX')
-    ck('a rail still is', pw.STATE['glitches'], before + 1)
-    pw.STATE['glitches'] = before
+    before = track.glitches
+    track.log('DROPOUT', '-', 'rig sat still')
+    ck('a dropout is not counted as a glitch', track.glitches, before)
+    track.log('RAIL', 'BRAKE', 'went to MAX')
+    ck('a rail still is', track.glitches, before + 1)
+
+    # The silence-then-return cycle: one DROPOUT per gap however long the reader
+    # spins, then exactly one RESUMED when a report finally lands.
+    gapped = tracker.Tracker(layout)
+    gapped.ingest(STEER_PHASE, now)
+    quiet = now + tracker.GAP + 1.0
+    for _ in range(5):
+        gapped.note_idle(quiet)
+    kinds = [e['kind'] for e in gapped.snapshot()['events']]
+    ck('a gap logs one DROPOUT, not one per poll', kinds.count('DROPOUT'), 1)
+    gapped.note_idle(now + 0.1)          # inside GAP - nothing to report
+    ck('a gap shorter than GAP logs nothing',
+       [e['kind'] for e in gapped.snapshot()['events']].count('DROPOUT'), 1)
+    gapped.ingest(STEER_PHASE, quiet)
+    kinds = [e['kind'] for e in gapped.snapshot()['events']]
+    ck('the stream returning logs RESUMED once', kinds.count('RESUMED'), 1)
+    ck('and neither counts as a fault', gapped.glitches, 0)
 
     # a bit already high in the very first report was never seen going down
-    pw.reset_tracking()
+    stuck = tracker.Tracker(layout)
     held = bytearray(STEER_PHASE)
     held[1] |= 0x02                                  # button 6 high from the off
-    pw.STATE['count'] = 1
-    pw.STATE['report'] = bytes(held)
-    pw.STATE['lo'] = pw.STATE['hi'] = list(held)
-    pw.note_buttons(decode.button_mask(bytes(held), spec), spec, now)
+    stuck.ingest(bytes(held), now)
     ck('a bit high in the first report IS called stuck',
-       next(b['stuck'] for b in pw.snapshot()['buttons'] if b['n'] == 6), True)
+       next(b['stuck'] for b in stuck.snapshot()['buttons'] if b['n'] == 6), True)
 
     print('\n[7] byte accounting and the jitter maths')
     labels = decode.byte_labels(layout)
@@ -294,16 +280,13 @@ def main():
     # A byte moving that the descriptor does not claim is how an undocumented
     # field would ever get noticed.
     orphan = layout['vendor'][-1]
-    pw.reset_tracking()
-    pw.install_layout(dict(layout, vendor=layout['vendor'][:-1]))
-    pw.STATE['lo'] = list(STEER_PHASE)
-    pw.STATE['hi'] = list(STEER_PHASE)
-    pw.STATE['hi'][orphan] ^= 0x01
-    pw.STATE['report'] = STEER_PHASE
+    blind = tracker.Tracker(dict(layout, vendor=layout['vendor'][:-1]))
+    moved = bytearray(STEER_PHASE)
+    moved[orphan] ^= 0x01
+    blind.ingest(STEER_PHASE, now)
+    blind.ingest(bytes(moved), now)
     ck('a byte that moves and nothing claims is flagged',
-       orphan in pw.snapshot()['undecoded'], True)
-    pw.reset_tracking()
-    pw.install_layout(layout)
+       orphan in blind.snapshot()['undecoded'], True)
 
     # Reversal count separated the healthy brake from the faulty throttle.
     ck('a clean sweep never reverses', decode.reversals([0, 10, 20, 30]), 0)
