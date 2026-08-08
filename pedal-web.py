@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 
+import decode
 import ffb
 import hid_layout
 import sysstate
@@ -37,36 +38,6 @@ MOTION_MIN16 = 200 # peak-to-peak below this in WINDOW is dither (~+-30 LSB)
 MOTION_MIN8 = 2
 HIST_LEN = 900
 SPARK = 180
-
-# Pot dividers off the 3.3V sensor supply; STEER is an encoder, so no volts.
-VOLT_CHANNELS = {'THROTTLE', 'BRAKE', 'CLUTCH'}
-
-# Hardware button number -> rim function, per the ftec_keymap comments in
-# hid-fanatec 0.2.3 (hid-ftec.c).
-BTN_FN = {
-    1: 'Square', 2: 'Cross', 3: 'Circle', 4: 'Triangle',
-    5: 'GEAR UP  (right shift paddle)', 6: 'GEAR DOWN  (left shift paddle)',
-    7: 'R2', 8: 'L2', 9: 'SH / Start', 10: 'OP / Select', 11: 'R3', 12: 'L3',
-    13: 'Shifter R', 21: '(unknown)', 22: 'PS / Xbox / R toggle-up',
-    23: 'Funky twist left', 24: 'Funky twist right',
-    25: 'Funky push', 26: 'Ministick push',
-    27: 'L toggle-up', 28: '(unknown)',
-    29: 'Sequential gear down', 30: 'Sequential gear up',
-    31: 'R toggle-down', 32: 'L toggle-down',
-    33: 'R toggle-up-normal', 34: 'L toggle-up-normal',
-    35: '(unknown)', 36: '(unknown)',
-    61: 'L analog paddle (as button)', 62: 'R analog paddle (as button)',
-}
-for _i in range(7):
-    BTN_FN[14 + _i] = f'Shifter {_i + 1}'
-for _i in range(12):
-    _pos = (_i + 1) % 12 or 12
-    BTN_FN[37 + _i] = f'L knob pos {_pos}' + (' / twist right' if _i == 0
-                                              else ' / twist left' if _i == 1 else '')
-    BTN_FN[49 + _i] = f'R knob pos {_pos}' + (' / twist right' if _i == 0
-                                              else ' / twist left' if _i == 1 else '')
-
-HAT_DIRS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 
 LOCK = threading.Lock()
 LAYOUT = hid_layout.fallback_layout('device not opened yet')
@@ -161,48 +132,6 @@ def note_axis(name, val, now):
             seen[1] = val
 
 
-def axis_value(rep, ax):
-    """Decode one axis out of a report, or None if the report is too short."""
-    i = ax['byte']
-    if ax['bits'] == 16:
-        if len(rep) <= i + 1:
-            return None
-        return rep[i] | (rep[i + 1] << 8)
-    if len(rep) <= i:
-        return None
-    val = rep[i]
-    return val - 256 if ax['signed'] and val > 127 else val
-
-
-def button_mask(rep, spec):
-    """The button bits as one integer, bit 0 = lowest-numbered button."""
-    need = (spec['first_bit'] + spec['count'] + 7) // 8
-    if len(rep) < need:
-        return 0
-    whole = int.from_bytes(bytes(rep[:need]), 'little')
-    return (whole >> spec['first_bit']) & ((1 << spec['count']) - 1)
-
-
-def decode_vendor(rep):
-    """Firmware version / wheel id / pedal presence out of the vendor block.
-
-    Mirrors ftecff_raw_event() in hid-ftecff.c, shifted by one for the report id
-    this base does not send - which is why its sysfs copies read 0. See
-    docs/driver.md.
-    """
-    out = {}
-    if len(rep) != 33:               # offsets only mean anything at this shape
-        return out
-    if rep[29] == 0xff:
-        if rep[30] == 0x04:
-            out['pedals'] = bool(rep[31] & 0x0f)
-            out['handbrake'] = bool(rep[31] >> 4 & 0x0f)
-    else:
-        out['wheel_id'] = rep[30]
-        out['fw_version'] = rep[31] | (rep[32] << 8)
-    return out
-
-
 def note_buttons(mask, spec, now):
     """Latch button state; log presses, and log a first-ever press loudly."""
     # A bit high in the first report was never watched going down = "stuck on",
@@ -225,7 +154,7 @@ def note_buttons(mask, spec, now):
         if on:
             rec['count'] += 1
             rec['last'] = now
-            label = BTN_FN.get(num, '')
+            label = decode.BTN_FN.get(num, '')
             if not rec['ever']:
                 rec['ever'] = True
                 event('BTN-NEW', f'btn {num}',
@@ -324,7 +253,7 @@ def reader():
                                     STATE['hi'][i] = b
 
                         for ax in LAYOUT['axes']:
-                            val = axis_value(rep, ax)
+                            val = decode.axis_value(rep, ax)
                             if val is None:
                                 continue
                             name = ax['name']
@@ -345,7 +274,7 @@ def reader():
 
                         spec = LAYOUT['buttons']
                         if spec:
-                            mask = button_mask(rep, spec)
+                            mask = decode.button_mask(rep, spec)
                             if mask != prev_mask:
                                 note_buttons(mask, spec, now)
                                 prev_mask = mask
@@ -358,14 +287,14 @@ def reader():
                                 if hv not in HAT['ever'] and hv <= hat['lmax']:
                                     HAT['ever'].add(hv)
                                     event('HAT', 'hat',
-                                          f'first {HAT_DIRS[hv]} seen (raw {hv})')
+                                          f'first {decode.HAT_DIRS[hv]} seen (raw {hv})')
 
                         if LAYOUT['spare_bits']:
                             lo_b = LAYOUT['spare_bits'][0] // 8
                             hi_b = LAYOUT['spare_bits'][-1] // 8
                             STATE['spare'] = list(rep[lo_b:hi_b + 1])
 
-                        for key, val in decode_vendor(rep).items():
+                        for key, val in decode.decode_vendor(rep).items():
                             STATE[key] = val
         finally:
             try:
@@ -375,18 +304,6 @@ def reader():
         with LOCK:
             STATE['connected'] = False
         time.sleep(0.5)
-
-
-def reversals(vals):
-    n = 0
-    direction = 0
-    for a, b in zip(vals, vals[1:]):
-        d = (b > a) - (b < a)
-        if d and direction and d != direction:
-            n += 1
-        if d:
-            direction = d
-    return n
 
 
 def snapshot():
@@ -446,12 +363,12 @@ def snapshot():
                 'lmax': ax['lmax'],
                 'value': vals[-1] if vals else None,
                 'volts': (round(vals[-1] / 65535 * 3.3, 3)
-                          if vals and ax['name'] in VOLT_CHANNELS else None),
+                          if vals and ax['name'] in decode.VOLT_CHANNELS else None),
                 'min': seen[0] if seen else None,
                 'max': seen[1] if seen else None,
                 'span': (seen[1] - seen[0]) if seen else 0,
                 'jitter_sd': round(statistics.pstdev(recent), 1) if len(recent) > 1 else 0.0,
-                'jitter_rev': reversals(recent) if len(recent) > 1 else 0,
+                'jitter_rev': decode.reversals(recent) if len(recent) > 1 else 0,
                 'n_recent': len(recent),
                 'spark': vals[-SPARK:],
             }
@@ -487,7 +404,7 @@ def snapshot():
                     'n': num,
                     'byte': bit // 8,
                     'bit': bit % 8,
-                    'fn': BTN_FN.get(num, ''),
+                    'fn': decode.BTN_FN.get(num, ''),
                     'on': bool(rec and rec['on']),
                     'ever': bool(rec and rec['ever']),
                     'count': rec['count'] if rec else 0,
@@ -499,13 +416,13 @@ def snapshot():
         if LAYOUT['hat']:
             out['hat'] = {
                 'value': HAT['value'],
-                'dir': (HAT_DIRS[HAT['value']]
+                'dir': (decode.HAT_DIRS[HAT['value']]
                         if HAT['value'] is not None and HAT['value'] < 8 else 'centre'),
                 'ever': sorted(HAT['ever']),
                 'byte': LAYOUT['hat']['byte'],
             }
 
-        labels = byte_labels(LAYOUT)
+        labels = decode.byte_labels(LAYOUT)
         if lo and hi:
             for i in range(len(lo)):
                 out['bytes'].append({
@@ -523,27 +440,6 @@ def snapshot():
     out['ffb'] = ffb.status()
     out['ffb_enabled'] = FFB_ENABLED
     return out
-
-
-def byte_labels(layout):
-    """byte index -> what the descriptor says lives there."""
-    labels = {}
-    spec = layout['buttons']
-    if spec:
-        first, last = spec['first_bit'], spec['first_bit'] + spec['count'] - 1
-        for b in range(first // 8, last // 8 + 1):
-            labels[b] = 'buttons'
-    for bit in layout['spare_bits']:
-        labels.setdefault(bit // 8, 'spare button bits')
-    if layout['hat']:
-        b = layout['hat']['byte']
-        labels[b] = ('hat + ' + labels[b]) if b in labels else 'hat'
-    for ax in layout['axes']:
-        for k in range(ax['bits'] // 8):
-            labels[ax['byte'] + k] = ax['name']
-    for b in layout['vendor']:
-        labels[b] = 'vendor'
-    return labels
 
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')

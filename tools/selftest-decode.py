@@ -19,6 +19,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import decode                                              # noqa: E402
 import ffb                                                 # noqa: E402
 import hid_layout                                          # noqa: E402
 import sysstate                                            # noqa: E402
@@ -101,31 +102,31 @@ def main():
     by = {a['name']: a for a in layout['axes']}
 
     print('\n[2] axis decode of the archived steering-phase report')
-    ck('STEER    centred', pw.axis_value(STEER_PHASE, by['STEER']), 32783)
-    ck('THROTTLE at rest', pw.axis_value(STEER_PHASE, by['THROTTLE']), 65535)
-    ck('BRAKE    at rest', pw.axis_value(STEER_PHASE, by['BRAKE']), 65535)
-    ck('CLUTCH   at rest', pw.axis_value(STEER_PHASE, by['CLUTCH']), 65535)
-    ck('STICK-X  centred', pw.axis_value(STEER_PHASE, by['STICK-X']), 0)
-    ck('STICK-Y  centred', pw.axis_value(STEER_PHASE, by['STICK-Y']), 0)
-    ck('SLIDER', pw.axis_value(STEER_PHASE, by['SLIDER']), 255)
-    ck('DIAL signed', pw.axis_value(STEER_PHASE, by['DIAL']), -4)
+    ck('STEER    centred', decode.axis_value(STEER_PHASE, by['STEER']), 32783)
+    ck('THROTTLE at rest', decode.axis_value(STEER_PHASE, by['THROTTLE']), 65535)
+    ck('BRAKE    at rest', decode.axis_value(STEER_PHASE, by['BRAKE']), 65535)
+    ck('CLUTCH   at rest', decode.axis_value(STEER_PHASE, by['CLUTCH']), 65535)
+    ck('STICK-X  centred', decode.axis_value(STEER_PHASE, by['STICK-X']), 0)
+    ck('STICK-Y  centred', decode.axis_value(STEER_PHASE, by['STICK-Y']), 0)
+    ck('SLIDER', decode.axis_value(STEER_PHASE, by['SLIDER']), 255)
+    ck('DIAL signed', decode.axis_value(STEER_PHASE, by['DIAL']), -4)
 
     print('\n[3] each capture phase moves only its own channel')
-    ck('throttle phase -> Z moved', pw.axis_value(THR_PHASE, by['THROTTLE']), 65337)
+    ck('throttle phase -> Z moved', decode.axis_value(THR_PHASE, by['THROTTLE']), 65337)
     ck('throttle phase -> Rz still at rest',
-       pw.axis_value(THR_PHASE, by['BRAKE']), 65535)
-    ck('brake phase -> Rz moved', pw.axis_value(BRK_PHASE, by['BRAKE']), 65407)
+       decode.axis_value(THR_PHASE, by['BRAKE']), 65535)
+    ck('brake phase -> Rz moved', decode.axis_value(BRK_PHASE, by['BRAKE']), 65407)
     ck('brake phase -> Z still at rest',
-       pw.axis_value(BRK_PHASE, by['THROTTLE']), 65535)
+       decode.axis_value(BRK_PHASE, by['THROTTLE']), 65535)
 
     print('\n[4] vendor block - independent confirmation of the offsets')
-    info = pw.decode_vendor(STEER_PHASE)
+    info = decode.decode_vendor(STEER_PHASE)
     # 693 is what the base shows on its own display at boot, and its bcdDevice.
     ck('fw_version', info.get('fw_version'), 693)
     ck('wheel_id', info.get('wheel_id'), 0x20)
     variant = bytearray(STEER_PHASE)
     variant[29], variant[30], variant[31] = 0xff, 0x04, 0x11
-    ck('pedal-presence variant', pw.decode_vendor(bytes(variant)),
+    ck('pedal-presence variant', decode.decode_vendor(bytes(variant)),
        {'pedals': True, 'handbrake': True})
 
     print('\n[5] button bit math')
@@ -135,7 +136,7 @@ def main():
         bit = spec['first_bit'] + n - spec['first_usage']
         rep = bytearray(hid_layout.KNOWN_SIZE)
         rep[bit // 8] |= 1 << (bit % 8)
-        if pw.button_mask(bytes(rep), spec) != 1 << (n - spec['first_usage']):
+        if decode.button_mask(bytes(rep), spec) != 1 << (n - spec['first_usage']):
             collisions.append(n)
     ck('all buttons decode to their own bit', collisions, [])
     b5 = spec['first_bit'] + 5 - spec['first_usage']
@@ -144,7 +145,7 @@ def main():
        ((spec['first_bit'] + 107) // 8, (spec['first_bit'] + 107) % 8), (13, 7))
     # byte 15 rests at a constant 0x16 inside the declared button block.
     ck('no phantom buttons from byte 15',
-       pw.button_mask(STEER_PHASE, spec), 0)
+       decode.button_mask(STEER_PHASE, spec), 0)
     ck('spare bits are bytes 14-15',
        sorted({b // 8 for b in layout['spare_bits']}), [14, 15])
 
@@ -177,16 +178,16 @@ def main():
                 pw.STATE['lo'][i] = min(pw.STATE['lo'][i], b)
                 pw.STATE['hi'][i] = max(pw.STATE['hi'][i], b)
         for ax in layout['axes']:
-            val = pw.axis_value(rep, ax)
+            val = decode.axis_value(rep, ax)
             if val is not None:
                 pw.note_axis(ax['name'], val, now)
-        pw.note_buttons(pw.button_mask(rep, spec), spec, now)
+        pw.note_buttons(decode.button_mask(rep, spec), spec, now)
         hv = rep[layout['hat']['byte']] >> layout['hat']['shift'] & 0x0f
         if hv != pw.HAT['value']:
             pw.HAT['value'] = hv
             if hv <= layout['hat']['lmax']:
                 pw.HAT['ever'].add(hv)
-        for key, val in pw.decode_vendor(rep).items():
+        for key, val in decode.decode_vendor(rep).items():
             pw.STATE[key] = val
 
     snap = pw.snapshot()
@@ -218,14 +219,14 @@ def main():
     pw.reset_tracking()
     pw.install_layout(layout)
     brake = next(a for a in layout['axes'] if a['name'] == 'BRAKE')
-    rest = pw.axis_value(STEER_PHASE, brake)
+    rest = decode.axis_value(STEER_PHASE, brake)
     pressed = bytearray(STEER_PHASE)
     pressed[brake['byte']], pressed[brake['byte'] + 1] = 0x39, 0x30   # 12345
     for rep in (bytes(pressed),) + (STEER_PHASE,) * (pw.HIST_LEN + 50):
         pw.STATE['count'] += 1
         pw.STATE['report'] = rep
         for ax in layout['axes']:
-            pw.note_axis(ax['name'], pw.axis_value(rep, ax), now)
+            pw.note_axis(ax['name'], decode.axis_value(rep, ax), now)
     pw.STATE['lo'] = pw.STATE['hi'] = list(STEER_PHASE)
     aged = {a['name']: a for a in pw.snapshot()['axes']}['BRAKE']
     ck('a press that aged out of the sparkline is still latched',
@@ -277,12 +278,12 @@ def main():
     pw.STATE['count'] = 1
     pw.STATE['report'] = bytes(held)
     pw.STATE['lo'] = pw.STATE['hi'] = list(held)
-    pw.note_buttons(pw.button_mask(bytes(held), spec), spec, now)
+    pw.note_buttons(decode.button_mask(bytes(held), spec), spec, now)
     ck('a bit high in the first report IS called stuck',
        next(b['stuck'] for b in pw.snapshot()['buttons'] if b['n'] == 6), True)
 
     print('\n[7] byte accounting and the jitter maths')
-    labels = pw.byte_labels(layout)
+    labels = decode.byte_labels(layout)
     ck('every report byte is claimed by some field',
        sorted(set(range(layout['size'])) - set(labels)), [])
     ck('byte 22 is CLUTCH', labels[22], 'CLUTCH')
@@ -305,11 +306,11 @@ def main():
     pw.install_layout(layout)
 
     # Reversal count separated the healthy brake from the faulty throttle.
-    ck('a clean sweep never reverses', pw.reversals([0, 10, 20, 30]), 0)
-    ck('one direction change is one reversal', pw.reversals([0, 10, 5]), 1)
+    ck('a clean sweep never reverses', decode.reversals([0, 10, 20, 30]), 0)
+    ck('one direction change is one reversal', decode.reversals([0, 10, 5]), 1)
     ck('resting dither reverses on nearly every sample',
-       pw.reversals([100, 101, 100, 101, 100]), 3)
-    ck('a flat channel never reverses', pw.reversals([5, 5, 5, 5]), 0)
+       decode.reversals([100, 101, 100, 101, 100]), 3)
+    ck('a flat channel never reverses', decode.reversals([5, 5, 5, 5]), 0)
 
     print('\n[8] system checks (sysstate.py)')
     st = sysstate.state(force=True)
