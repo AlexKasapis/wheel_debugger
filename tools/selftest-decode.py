@@ -105,6 +105,13 @@ def main():
     ck('SLIDER', decode.axis_value(STEER_PHASE, by['SLIDER']), 255)
     ck('DIAL signed', decode.axis_value(STEER_PHASE, by['DIAL']), -4)
 
+    # What the page anchors a bar and a graph's centre line to. Wrong here and a
+    # centred wheel draws as half pressed, or a pedal grows out of its middle.
+    ck('STEER is centred mid-range', decode.axis_centre(by['STEER']), 32768)
+    ck('the signed rim axes centre at 0', decode.axis_centre(by['DIAL']), 0)
+    ck('a pedal has no centre', decode.axis_centre(by['THROTTLE']), None)
+    ck('nor does the slider', decode.axis_centre(by['SLIDER']), None)
+
     print('\n[3] each capture phase moves only its own channel')
     ck('throttle phase -> Z moved', decode.axis_value(THR_PHASE, by['THROTTLE']), 65337)
     ck('throttle phase -> Rz still at rest',
@@ -190,6 +197,22 @@ def main():
     json.dumps(snap)
     print('  ok   snapshot is JSON-serialisable')
 
+    # Coverage is a second latch beside seen: not how far a channel travelled
+    # but what it skipped on the way, which is what a pot dead spot looks like.
+    cov = axes['CLUTCH']['cover']
+    step = 65536 // tracker.COVER
+    ck('coverage has one bucket per slice of the range', len(cov), tracker.COVER)
+    ck('every sample lands in exactly one bucket', sum(cov), len(stream))
+    ck('the sweep marks the bucket it started in', cov[max(sweep) // step] > 0, True)
+    ck('and the bucket it ended in', cov[min(sweep) // step] > 0, True)
+    ck('a 4000-LSB step leaves gaps between them',
+       any(cov[b] == 0 for b in range(min(sweep) // step, max(sweep) // step)), True)
+    ck('a channel that never moved occupies one bucket alone',
+       [n for n in axes['THROTTLE']['cover'] if n], [len(stream)])
+    # 65535 must land in the last bucket, not one past the end
+    ck('a channel resting at the rail is in the top bucket',
+       axes['THROTTLE']['cover'][-1], len(stream))
+
     # The latch must outlive the rolling sparkline window, or a channel that
     # demonstrably worked reads as dead once HIST_LEN further reports arrive.
     track = tracker.Tracker(layout)
@@ -205,6 +228,8 @@ def main():
     ck('and the channel is NOT called idle', aged['idle'], False)
     ck('the press is gone from the sparkline, as expected',
        min(aged['spark']), rest)
+    ck('but its coverage bucket is still marked',
+       aged['cover'][12345 // (65536 // tracker.COVER)] > 0, True)
 
     # A report too short to carry BRAKE must skip it, not seed a [None, None]
     # latch that crashes the comparison on the next sample.
@@ -215,6 +240,8 @@ def main():
 
     track.reset()
     ck('reset clears the latch', track.seen, {})
+    ck('and the coverage buckets with it',
+       sum(sum(c) for c in track.cover.values()), 0)
 
     # A stream that died must not keep advertising its old rate, or the silence
     # gets blamed on the pedal.

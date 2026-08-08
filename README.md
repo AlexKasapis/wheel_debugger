@@ -28,9 +28,16 @@ Everything the base sends, decoded from the device's own HID report descriptor
 rather than from guessed byte offsets:
 
 - **Four analog axes** — steer, throttle, brake, clutch — with live value,
-  approximate voltage, an absolute full-scale bar and a sparkline
-- **Rim analog** — ministick X/Y, slider, dial — and the **hat switch** as a 3×3
-  grid, latching every direction it has ever seen
+  approximate voltage, an absolute full-scale bar, a sparkline, and a **range
+  coverage strip**: every bucket of the channel's range it has ever sat in,
+  latched since reset. Travel says how far a pedal got; coverage says what it
+  skipped on the way, which is what a dead spot in a pot looks like. Steering
+  anchors its bar at the centre rather than at zero.
+- **Rim analog** — the ministick as an **XY pad** (current position, its trail,
+  the box it has swept and the centre crosshair, so corner reach and
+  centre-return are one glance rather than two sparklines), plus slider and
+  dial — and the **hat switch** as a 3×3 grid, latching every direction it has
+  ever seen
 - **All 108 button bits.** Grey = never seen, blue = seen since reset, green =
   down now, red = stuck on. Hover for the rim function and the exact report
   byte/bit. A first-ever press logs `BTN-NEW`, so pressing every button once gives
@@ -57,9 +64,12 @@ rather than from guessed byte offsets:
   at 25% for 1.5 s each way, **measured** while it happens by reading `ABS_X` back
   off the same fd that uploads the effect. ABORT stops it and erases the effect.
 
-Sparklines auto-scale, so they always print their y-range: a channel resting with
-±30 LSB of dither would otherwise draw the same dramatic wiggle as a real full
-sweep.
+**Graph scale is a toggle**, remembered per browser. `FULL` (the default) draws
+every graph over the channel's own declared range, so channels are comparable and
+a resting one is a flat line where it actually rests. `FIT` auto-scales to what
+the channel is doing, which is the only way ±30 LSB of dither is visible at all —
+and the reason a graph always prints the range it just drew, in either mode. The
+coverage strip is always full-range: a zoomed one could not show a gap.
 
 ## Repository layout
 
@@ -90,7 +100,7 @@ reachable without a base attached.
 `tools/selftest-decode.py` replays the archived capture in `data/` through
 `Tracker.ingest()` — the same call the reader thread makes — and asserts the
 whole report map, the latching behaviour, the system checks and the FFB state
-machine. 99 checks. It runs with the base powered off and cannot move the wheel;
+machine. 112 checks. It runs with the base powered off and cannot move the wheel;
 run it after touching any offset logic.
 
 `tools/bracket-capture.py` is the same pipeline pointed at a scripted sequence:

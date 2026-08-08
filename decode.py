@@ -9,6 +9,11 @@ import hid_layout
 # Pot dividers off the 3.3V sensor supply; STEER is an encoder, so no volts.
 VOLT_CHANNELS = {'THROTTLE', 'BRAKE', 'CLUTCH'}
 
+# Unsigned channels that still rest mid-range. Nothing in the descriptor says
+# so - STEER declares a plain 0..65535 - but a bar anchored at 0 draws a centred
+# wheel as half pressed.
+CENTRED_CHANNELS = {'STEER'}
+
 HAT_DIRS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 
 
@@ -55,6 +60,18 @@ def axis_value(rep, ax):
         return None
     val = rep[i]
     return val - 256 if ax['signed'] and val > 127 else val
+
+
+def axis_centre(ax):
+    """The value this channel rests at mid-range, or None if it runs end to end.
+
+    A signed field is centred at 0 by definition; the rest is by name.
+    """
+    if ax['lmin'] < 0:
+        return 0
+    if ax['name'] in CENTRED_CHANNELS:
+        return (ax['lmin'] + ax['lmax'] + 1) // 2
+    return None
 
 
 def button_mask(rep, spec):

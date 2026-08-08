@@ -12,7 +12,7 @@ Standard library only, no venv, no build step, no test framework.
 
 ```sh
 python3 pedal-web.py --no-ffb      # the dashboard on :8765 — use this form
-python3 tools/selftest-decode.py   # 99 assertions, base can be powered off
+python3 tools/selftest-decode.py   # 112 assertions, base can be powered off
 python3 tools/bracket-capture.py   # scripted capture, needs someone at the rig
 python3 sysstate.py                # machine state as JSON
 python3 hid_layout.py [node]       # parsed report layout as JSON
@@ -117,9 +117,13 @@ from the descriptor, so they stay — but its length guard reads
 
 ### Invariants that are easy to break by accident
 
-- **Latch, don't sample.** `Tracker.seen` (min/max ever) is separate storage from
-  `Tracker.hist` (rolling window) so a press that ages out of the sparkline is
-  still latched. The dashboard exists to catch faults nobody was watching for.
+- **Latch, don't sample.** `Tracker.seen` (min/max ever) and `Tracker.cover`
+  (which buckets of the range were ever occupied) are separate storage from
+  `Tracker.hist` (rolling window), so a press that ages out of the sparkline is
+  still latched in both. The dashboard exists to catch faults nobody was watching
+  for. `cover` is sized to the layout and so is rebuilt with `hist` in
+  `_install()`: its buckets are positions in *that* layout's logical range and
+  mean nothing across a layout change.
 - **The base is send-on-change: at rest it transmits nothing.** So "no data"
   never distinguishes a dead control from a silent base, and every pedal test
   needs a positive control in the same window. This is why `DROPOUT` is logged
@@ -144,6 +148,19 @@ the commit message if you do.
 - The page is three files under `web/`, served from a fixed path table and read
   per request so editing CSS needs only a refresh. It used to be a 567-line
   Python string.
+- Graph scale defaults to `FULL`, not the auto-scaling `FIT`. Autoscale is the
+  more informative view and it is one click away, but it is also the one that
+  draws resting dither as a full sweep — so the honest view is the default and
+  every graph prints the range it drew, in either mode.
+- The full range comes from each axis's own `lmin`/`lmax` in the payload, never a
+  literal: `65535` typed into `app.js` would be a fourth copy of the report map,
+  and the signed rim axes are `-128..127`. `decode.CENTRED_CHANNELS` is the one
+  exception — a channel that rests mid-range but declares a plain unsigned range,
+  which is a physical fact the descriptor cannot carry. It holds `STEER` alone;
+  signed fields are centred at 0 by definition and need no entry.
+- Axis cards are reused by position but keyed by `data-kind`/`data-key`, so a
+  slot that changes what it holds is rebuilt. An axis skeleton reused as the
+  ministick pad has none of the pad's elements.
 - Stdlib only. The README leads with it.
 - `hid_layout.layout_for()` and `sysstate._collect()` catch bare `Exception` on
   purpose — a diagnostic that dies on a surprise is worse than one that degrades

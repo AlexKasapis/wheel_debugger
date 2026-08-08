@@ -22,6 +22,9 @@
 
 <div id="actions">
   <button onclick="reset()">reset stats &amp; event log</button>
+  <div id="scale">graph scale<button id="sc-full"
+    onclick="setScale('full')">FULL</button><button id="sc-fit"
+    onclick="setScale('fit')">FIT</button></div>
   <div id="ffbwrap">
     <button id="hold" disabled><i class="fillbar"></i><span class="lbl">hold to
       run FFB test</span></button>
@@ -35,7 +38,8 @@
 <h2>Live motion <span class="sub">(what changed in the last 2 s)</span></h2>
 <div id="motion" class="sub">nothing moving</div>
 
-<h2>Analog axes</h2>
+<h2>Analog axes <span class="sub">(the strip under each graph is range coverage:
+   every bucket the channel has ever sat in. A gap mid-sweep is a dead spot)</span></h2>
 <div class="grid" id="chans"></div>
 
 <h2>Rim analog <span class="sub">(ministick, slider, dial)</span></h2>

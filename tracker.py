@@ -26,6 +26,10 @@ MOTION_MIN16 = 200 # peak-to-peak below this in WINDOW is dither (~+-30 LSB)
 MOTION_MIN8 = 2
 HIST_LEN = 900
 SPARK = 180
+COVER = 64         # buckets across a channel's logical range. A worn pot wiper
+                   # leaves empty buckets mid-sweep; 1024 LSB each on a 16-bit
+                   # channel, fine enough to see a dead spot and coarse enough
+                   # that a clean sweep fills every one.
 
 # DROPOUT is excluded: every rest longer than GAP fires one, which would bury the
 # real JUMP/RAIL catches under a total made of the rig sitting still.
@@ -91,6 +95,9 @@ class Tracker:
         self.layout = layout
         self.hist = {ax['name']: collections.deque(maxlen=HIST_LEN)
                      for ax in layout['axes']}
+        # Buckets are positions in *this* layout's logical range, so they are
+        # meaningless across a layout change and get rebuilt with the history.
+        self.cover = {ax['name']: [0] * COVER for ax in layout['axes']}
 
     def reset(self):
         with self._lock:
@@ -188,7 +195,7 @@ class Tracker:
             if val is None:            # report too short for this axis
                 continue
             name = ax['name']
-            self._note_axis(name, val, now)
+            self._note_axis(ax, val, now)
 
             old = self._prev.get(name)
             wide = ax['bits'] == 16
@@ -203,8 +210,9 @@ class Tracker:
                             'went to ' + ('MAX 65535' if val else 'MIN 0'))
             self._railed[name] = at_rail
 
-    def _note_axis(self, name, val, now):
+    def _note_axis(self, ax, val, now):
         """Rolling history AND the latched min/max, so no path can miss one."""
+        name = ax['name']
         self.hist[name].append((now, val))
         seen = self.seen.get(name)
         if seen is None:
@@ -214,6 +222,22 @@ class Tracker:
                 seen[0] = val
             if val > seen[1]:
                 seen[1] = val
+        self._note_cover(ax, val)
+
+    def _note_cover(self, ax, val):
+        """Latch which slice of the range this channel has ever occupied.
+
+        min/max says how far a channel travelled; this says what it skipped on
+        the way, which is what a dead spot in a pot looks like.
+        """
+        buckets = self.cover.get(ax['name'])
+        span = ax['lmax'] - ax['lmin'] + 1
+        if buckets is None or span <= 0:
+            return
+        # clamped, not dropped: a value outside the declared logical range still
+        # happened, and losing it would understate the occupancy of a rail
+        i = (val - ax['lmin']) * COVER // span
+        buckets[min(COVER - 1, max(0, i))] += 1
 
     def _note_buttons_changed(self, report, now):
         spec = self.layout['buttons']
@@ -339,6 +363,7 @@ class Tracker:
                 'bits': ax['bits'],
                 'lmin': ax['lmin'],
                 'lmax': ax['lmax'],
+                'centre': decode.axis_centre(ax),
                 'value': vals[-1] if vals else None,
                 'volts': (round(vals[-1] / 65535 * 3.3, 3)
                           if vals and ax['name'] in decode.VOLT_CHANNELS else None),
@@ -351,6 +376,8 @@ class Tracker:
                 'jitter_rev': decode.reversals(recent) if len(recent) > 1 else 0,
                 'n_recent': len(recent),
                 'spark': vals[-SPARK:],
+                # latched like seen, not windowed like spark
+                'cover': list(self.cover.get(ax['name']) or ()),
                 # latched, not windowed: "never moved since you pressed reset"
                 'idle': seen is None or span == 0,
             }

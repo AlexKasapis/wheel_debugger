@@ -71,7 +71,10 @@ Both explanations remain open, and they produce the same signature:
 
 1. **Worn / oxidised pot wiper.** A connector swap put the throttle pedal in the
    known-good clutch-IN channel and it still produced garbage, so the fault
-   follows the pedal.
+   follows the pedal. The **range coverage strip** under the THROTTLE graph is
+   the direct test: sweep the pedal slowly end to end and a healthy pot fills
+   every bucket, while a dead spot on the track leaves a gap at the same place
+   every sweep. Coverage is latched, so the sweep does not have to be one motion.
 2. **Mechanically flaky jack.** Nudging the plug while seated makes readings go
    bad or drop to zero, and the collapse is visible **at the pot's own pins** —
    the interruption is in the jack/plug contact, not downstream on the board. Not
@@ -125,7 +128,10 @@ Each needs a positive control in the same window.
    fields). Hold the rim firmly still, move only the ministick, and read the
    live-motion panel. STEER dithering by tens of LSB = independent, as declared;
    swinging thousands with the rim held = something really is shared, and `ACP`
-   mode 4 becomes the suspect.
+   mode 4 becomes the suspect. The ministick's own XY pad answers the separate
+   question of whether the stick itself is healthy: roll it round the rim and the
+   trail should reach all four corners of the swept box and come back to the
+   crosshair when released.
 
 ## Repair targets
 
