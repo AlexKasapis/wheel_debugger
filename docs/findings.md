@@ -40,25 +40,38 @@ reproduces this on demand rather than relying on a capture nobody kept.
 Full travel (789 → 64745, 97.6%), ~±30 LSB dither at rest (stdev ~10). Wheel does
 not self-centre and has firm end stops; range init landed fine.
 
-## Brake — healthy load cell, intermittent connection
+## Brake — the base reads the channel; the fault is past the jack
 
 Measured healthy before the pedals were disassembled: full 0 → 65535 travel, 11
-reversals in 417 samples. Then went silent — and a bracketed capture proved the
-silence was real, not a quiet base:
+reversals in 417 samples. Then went silent. A bracketed capture proved the
+silence was real rather than a quiet base — and its unplug leg proved where the
+fault is *not*:
 
-    63.4 - 67.3 s   STEER  32935 -> 54931      stream alive
-    67.3 - 78.0 s   BRAKE pressed      NOTHING <-- bracketed null
-    78.0 - 81.2 s   STEER  54916 -> 32646      stream still alive
-    -------- brake plug reseated --------
-    96.3 - 100.1 s  BRAKE  0 -> 65535 -> 0     ** CHANNEL ALIVE **
+    STEER   22027 -> 36808   22.6%     stream alive, 549 Hz
+    BRAKE   pressed hard, 10 s         0 -> 0, nothing   <-- bracketed null
+    STEER   24169 -> 39224   23.0%     stream still alive
+    -------- brake plug pulled --------
+    BRAKE       0 -> 65535  100.0%     ** the base IS reading this channel **
+    -------- brake plug back in -------
+    BRAKE   18389 -> 0        JUMP     settles at the pressed end again
 
-No other byte in the report moved during the pre-reseat presses either, so the
-data was absent from the whole report rather than mislabelled. **The fault was
-the connection, not the load cell and not the board.**
+`ABS_RZ` tracked the raw bytes through the unplug transition, so **the brake-IN
+jack, the ADC, the report, `hid-fanatec` and evdev all work.** A game reading
+this axis is being told the truth, and the dashboard showing a flat brake was
+never a display bug.
 
-Not yet reliable: only one good press was captured, and a later window bracketed
-by steering on both sides contained no brake data. A connector that works after
-reseating and then quits is the same signature the throttle jack has.
+Connected and untouched, the channel sits at 0. Every pedal channel rests at
+65535 and falls under press ([report-map.md](report-map.md)), so 0 is the
+*fully-pressed* end: something past the jack holds the signal at the bottom of
+the scale. That is neither a released pedal nor an open circuit — open reads
+65535, as the unplug leg shows.
+
+This supersedes the earlier "intermittent connection" reading. Reseating fixed it
+once and no longer does, and the failure is now a steady pin rather than a
+dropout.
+
+`brF` cannot cause this. It scales force to output; no setting makes an untouched
+pedal report past full press. The tuning menu is not on the path to this fault.
 
 ## Throttle — faulty, two live hypotheses
 
@@ -103,14 +116,24 @@ samples) through the throttle-IN channel.
 
 Each needs a positive control in the same window.
 
-1. **Is the brake reseat durable?** Several bracketed presses. If it quits again,
-   watch byte 20 while unplugging/replugging — if the value moves at all on
-   unplug, the channel is alive and reading the pedal.
-2. **Brake substitution.** Brake pedal → throttle-IN jack (known good). If it
-   registers on byte 18, the pedal and cable are fine and the fault is the
-   brake-IN channel.
-3. **Does the clutch pedal reach byte 22?** Press it and watch the CLUTCH card.
-   Unproven either way until then.
+1. **Which side of the brake jack holds the signal at 0?** The channel itself is
+   proven alive (above), so the fault is the pedal, its cable, or the jack's
+   contacts. **Swap the brake and throttle pedals between their jacks** —
+   throttle-IN is known good, and the throttle pedal's noise is unmistakable
+   wherever it lands. Brake pedal still pinned at 0 on byte 18 = the pedal or its
+   cable; throttle pedal misbehaving its usual way on byte 20 = the brake-IN jack
+   is fine. One swap answers both directions.
+2. **What does an unplugged *pot* channel read?** An old note claims THROTTLE
+   reads 0 unplugged while BRAKE reads 65535 — an asymmetry nothing in `data/`
+   shows, and it decides how much a resting 65535 is worth. Unplug the clutch and
+   watch byte 22. Dropping to 0 makes the asymmetry real *and* shows the clutch
+   jack reading a connected pot, which would clear repair target 2. Staying at
+   65535 means that channel tells you nothing either way.
+3. **Does the clutch pedal reach byte 22?** No. A bracketed capture pressed it for
+   6 s with the stream alive throughout and byte 22 never left 65535. That does
+   not name a cause: 65535 is also what a released pot reads, so a healthy jack
+   whose axis is driven elsewhere (see 4) fits the same data as a dead one.
+   Question 2 separates them.
 4. **Are the rim's analog paddles hijacking the clutch axis?** Fanatec's `ACP`
    defaults to `1 CbP` — on a rim with analog paddles, the *paddles* drive the
    clutch axis — and upstream warns mode `4 AnA` "is shared and interferes with

@@ -45,12 +45,26 @@ byte (see [driver.md](driver.md) for why the driver itself never reads them):
 From the archived capture: `fw_version` 693, `wheel_id` `0x20` (not in
 `hid-ftec.h`'s known-rim list).
 
-## Resting values
+## Resting values and polarity
 
 From `data/raw-pedal-map.log`, first report of the steering phase: STEER 32783
 (centred), THROTTLE 65535, BRAKE 65535, CLUTCH 65535, ministick 0/0, Slider 255,
-Dial −4. With the pedals unplugged, THROTTLE rests at 0 and BRAKE at 65535
-instead.
+Dial −4.
 
-A load cell at zero force resting at 0 is *correct*, so brake = 0 is not by
-itself a disconnection signature.
+**All three pedal channels rest at 65535 and fall towards 0 under press** — full
+scale is the *released* end. The archived capture shows it twice: bytes 18-23 are
+`ff ff` at rest, and the brake phase sweeps to 0. A later bracketed capture
+caught the throttle doing the same, 65535 → 63699. Games are therefore told every
+pedal is inverted and need their own invert setting; that is this base's
+polarity, not a fault.
+
+So **brake = 0 is the fully-pressed end, not a resting value** — a brake sitting
+at 0 untouched is pinned past full press. (An earlier note here claimed a load
+cell at zero force resting at 0 was *correct*. It contradicted the resting values
+directly above it, and the unplug capture in [findings.md](findings.md) settled
+it.)
+
+With the brake unplugged the channel reads 65535, observed directly. The
+equivalent for an unplugged *pot* channel is not established: an old note claimed
+THROTTLE reads 0 unplugged, which would make the two input circuits asymmetric,
+but nothing in `data/` shows it.
