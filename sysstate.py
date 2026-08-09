@@ -167,8 +167,8 @@ def check_diagnostic_state(_nodes):
                    fix_cmd('revert-rawhid.sh'),
                    'correct for pedal work, and it costs games nothing: the '
                    'driver never injects a PID collection on this base, so the '
-                   'HIDRAW route has no force feedback either way - see '
-                   'docs/findings.md for the launch option games need instead')
+                   'HIDRAW route has no force feedback either way - games need '
+                   'PROTON_DISABLE_HIDRAW=0x0EB7/0x0E03 instead')
     return chk('diagnostic_state', 'HID mode', 'warn',
                f'{MODPROBE_CONF} exists but does not set hidraw_pid=0: '
                f'{text.strip()[:80]}')

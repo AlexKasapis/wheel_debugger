@@ -52,19 +52,15 @@ there:
   makes, so the dashboard's button really does prove this path.
 
 Proton has preferred HIDRAW for Fanatec bases since 10.0-2, so the default lands
-on the route that cannot work here. **`PROTON_DISABLE_HIDRAW=0x0EB7/0x0E03` as a
-launch option** should put the game on the libinput/SDL route — *expected, not
-yet confirmed at the rig*: it follows from the SDL device being present and
-PID-capable in the log below, and from `ffb.py` proving `EV_FF` moves the wheel,
-but no run has been made with it set. Upstream documents
-`PROTON_DISABLE_HIDRAW=1`; the vid/pid form is what `winebus.sys` parses and what
-Proton itself writes, and which of the two the parser accepts is untested.
-Expect to re-map controls once — the DirectInput instance changes with the route.
+on the route that cannot work here. The launch option that puts it back on the
+libinput/SDL route is **confirmed to restore force feedback in ACC**:
 
-Rim and base LEDs stay dark on that route, and that is not a separate fault:
-ACC drives them through the Fanatec SDK, which needs the HIDRAW device, and the
-clone carries nothing to drive. With 0.2.3 on this base, LEDs and force feedback
-cannot both work.
+    PROTON_DISABLE_HIDRAW=0x0EB7/0x0E03 %command%
+
+The vid/pid form is what `winebus.sys` parses and what Proton itself writes;
+upstream documents a bare `=1`, which was never needed and stays untested here.
+The DirectInput instance changes with the route, so expect to re-map controls
+once.
 
 The consequence for this repo: because no game should be on the HIDRAW route,
 **diagnostic mode is free**. `enable-rawhid.sh` and in-game force feedback are
@@ -81,6 +77,28 @@ took. The lines that matter, from the run that established all of the above:
 Wine parsed a 1334-byte descriptor full of usage-page `0x0F` items — that is
 Wine's *synthesised* one for the SDL device, not the base's. The base and its
 clone are 133 bytes with no `0x0F` anywhere.
+
+## Rim LEDs — the game cannot drive them, the kernel can
+
+The RPM LEDs stay dark in ACC and always have. That is the same root cause as
+the force feedback, one step further on: ACC lights them through the Fanatec
+SDK, the SDK talks to the HIDRAW device, and on this base that device is the
+descriptor clone with nothing behind it. Taking the libinput/SDL route to get
+force feedback puts the game further still from the SDK. **No launch option
+makes ACC light these LEDs on 0.2.3.** It is not a wiring fault and not the rim.
+
+The driver's own LED-class interface is a separate path and it is present and
+reachable:
+
+    .../0003:0EB7:0E03.<n>/leds/0003:0EB7:0E03.<n>::RPM1..RPM9/brightness
+    -rw-rw---- root games        all reading 0
+
+`games`-writable, so a userspace process can light them without root — see the
+udev caveat in [driver.md](driver.md) about a sysfs rebind leaving these
+root-owned until a replug. Driving them *from telemetry* is what upstream's
+companion project `hid-fanatecff-tools` exists for: it reads the game's shared
+memory and writes these files. That is the only route to working rim LEDs here,
+and it is outside this repo.
 
 ## Steering — healthy
 
