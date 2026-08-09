@@ -35,6 +35,29 @@ pointing HIDRAW at the real base; `setup/revert-rawhid.sh` undoes it. The
 dashboard's system checks detect which device it is reading by parsing the
 descriptor, and say `READING THE WRONG DEVICE` rather than `not connected`.
 
+### That device is what games get force feedback through
+
+It is not dead weight. `ftec_client_rdesc_fixup()` (`hid-ftec.c:249`) copies the
+base's own descriptor and **injects an HID PID collection** into it, then
+`ftec_create_client_hid()` publishes that as the device HIDRAW points at. Wine
+and Proton implement DirectInput force feedback by writing HID PID reports; the
+real base speaks a proprietary protocol and declares no PID, so without the
+injected collection there is nothing for a game to write to. The driver
+intercepts those PID reports and translates them (upstream README, "Integration
+with Wine/Proton"). Proton enables HIDRAW for Fanatec bases by default from
+10.0-2 on, so this is the live path, not a fallback.
+
+`hidraw_pid=0` skips `hid-ftec.c:912` entirely — no client device, no PID
+collection. A game still sees every axis and button, because those come from the
+unmodified descriptor, and gets **no force feedback at all**. That is the price
+of raw byte access, and it is the whole price: nothing else about the base
+changes.
+
+The kernel's own `EV_FF` interface is untouched either way — `ftecff_init()` runs
+regardless of `hidraw_pid`. So `ffb.py`, which uploads through `EVIOCSFF` on the
+event node, works in both modes. **The dashboard's FFB button is therefore not a
+positive control for in-game FFB**: it exercises a path no Proton game uses.
+
 `/sys/module/hid_fanatec/parameters/hidraw_pid` does not exist, so the live
 parameter cannot be read back; the modprobe.d file is the only available proxy.
 

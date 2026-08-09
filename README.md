@@ -122,8 +122,8 @@ each is needed and hands you the command with the path filled in.
 | Script | Purpose |
 | --- | --- |
 | `install-ffb.sh` | Installs the `hid-fanatecff` driver via DKMS. Clones upstream into `vendor/` on first run. Root. |
-| `enable-rawhid.sh` | Points HIDRAW at the **real** base instead of the driver's virtual PID device. Needed for raw byte inspection. |
-| `revert-rawhid.sh` | Undoes the above |
+| `enable-rawhid.sh` | Points HIDRAW at the **real** base instead of the driver's virtual PID device. Needed for raw byte inspection, and it costs in-game force feedback — see [docs/driver.md](docs/driver.md#the-virtual-pid-device--the-expensive-trap). |
+| `revert-rawhid.sh` | Undoes the above. Run it before you go driving. |
 
 ```sh
 sudo bash setup/install-ffb.sh   # only if the system checks say to

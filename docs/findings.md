@@ -35,6 +35,35 @@ Constant force at 25% while sampling `ABS_X`:
 Objective torque, not an `EV_FF` capability bit. The dashboard's FFB button
 reproduces this on demand rather than relying on a capture nobody kept.
 
+### There are two FFB paths and the button only proves one
+
+That measurement uses `EVIOCSFF` on the event node. Proton games do not: they
+write HID PID reports to the HIDRAW device, which is the driver's *injected* PID
+collection and not the base's own descriptor. The paths are independent, so a
+wheel that answers the dashboard's button and stays dead in a game is not a
+contradiction and says nothing about the hardware.
+
+`hidraw_pid=0` — what `setup/enable-rawhid.sh` sets, and what raw byte
+inspection requires — removes the PID collection while leaving `EV_FF` intact.
+That produces exactly this split: axes, buttons and pedals all correct in-game,
+no force at the rim, dashboard button fine. See
+[driver.md](driver.md#that-device-is-what-games-get-force-feedback-through).
+The `HID mode` system check reports which mode the box is in and hands over the
+revert command; ask it rather than guessing.
+
+Two things make a revert look like it failed:
+
+- `revert-rawhid.sh` rebinds through sysfs, which emits `bind` — the udev rule
+  only matches `add|change` (above), so the new node can come up root-owned and
+  a game cannot open it. **Replug the base or reboot after reverting**, then
+  check the mode with `ls -l` on the hidraw node.
+- The Wine prefix caches the device as it first enumerated it, PID-less. Clear
+  it with `protontricks -c "wine reg delete 'HKLM\System\CurrentControlSet\Enum\HID' /f" <appid>`.
+
+`PROTON_LOG=1 WINEDEBUG=+hid,+input,+dinput %command%` as a launch option
+settles which path a game actually took: the log names `found 3 TLCs` when
+Proton has picked up the PID-extended descriptor.
+
 ## Steering — healthy
 
 Full travel (789 → 64745, 97.6%), ~±30 LSB dither at rest (stdev ~10). Wheel does
