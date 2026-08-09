@@ -165,10 +165,10 @@ def check_diagnostic_state(_nodes):
         return chk('diagnostic_state', 'HID mode', 'warn',
                    f'DIAGNOSTIC - {MODPROBE_CONF} sets hidraw_pid=0',
                    fix_cmd('revert-rawhid.sh'),
-                   'correct for pedal work, but it drops the injected HID PID '
-                   'collection, so games under Proton get axes and buttons and '
-                   'no force feedback - the FFB button here still works, it '
-                   'takes a different path')
+                   'correct for pedal work, and it costs games nothing: the '
+                   'driver never injects a PID collection on this base, so the '
+                   'HIDRAW route has no force feedback either way - see '
+                   'docs/findings.md for the launch option games need instead')
     return chk('diagnostic_state', 'HID mode', 'warn',
                f'{MODPROBE_CONF} exists but does not set hidraw_pid=0: '
                f'{text.strip()[:80]}')

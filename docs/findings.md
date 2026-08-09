@@ -37,32 +37,50 @@ reproduces this on demand rather than relying on a capture nobody kept.
 
 ### There are two FFB paths and the button only proves one
 
-That measurement uses `EVIOCSFF` on the event node. Proton games do not: they
-write HID PID reports to the HIDRAW device, which is the driver's *injected* PID
-collection and not the base's own descriptor. The paths are independent, so a
-wheel that answers the dashboard's button and stays dead in a game is not a
-contradiction and says nothing about the hardware.
+That measurement uses `EVIOCSFF` on the event node. A Proton game reaches the
+wheel by one of two entirely separate routes, and only one of them ends up
+there:
 
-`hidraw_pid=0` — what `setup/enable-rawhid.sh` sets, and what raw byte
-inspection requires — removes the PID collection while leaving `EV_FF` intact.
-That produces exactly this split: axes, buttons and pedals all correct in-game,
-no force at the rim, dashboard button fine. See
-[driver.md](driver.md#that-device-is-what-games-get-force-feedback-through).
-The `HID mode` system check reports which mode the box is in and hands over the
-revert command; ask it rather than guessing.
+- **HIDRAW.** Proton reads the HID descriptor and writes DirectInput force as
+  HID PID reports. This needs a PID collection in the descriptor, which
+  `hid-fanatec` is supposed to inject. **On this base it does not** — the
+  injection is gated on a Report ID this descriptor never declares, so the
+  client device is a byte-identical clone of the real one. No PID, no force,
+  ever. See [driver.md](driver.md#on-this-base-it-carries-no-pid-so-games-get-no-force-feedback-from-it).
+- **libinput/SDL.** Wine synthesises its *own* PID collection from the device's
+  haptic capability and drives it through `EV_FF` — the same call `ffb.py`
+  makes, so the dashboard's button really does prove this path.
 
-Two things make a revert look like it failed:
+Proton has preferred HIDRAW for Fanatec bases since 10.0-2, so the default lands
+on the route that cannot work here. **`PROTON_DISABLE_HIDRAW=0x0EB7/0x0E03` as a
+launch option** should put the game on the libinput/SDL route — *expected, not
+yet confirmed at the rig*: it follows from the SDL device being present and
+PID-capable in the log below, and from `ffb.py` proving `EV_FF` moves the wheel,
+but no run has been made with it set. Upstream documents
+`PROTON_DISABLE_HIDRAW=1`; the vid/pid form is what `winebus.sys` parses and what
+Proton itself writes, and which of the two the parser accepts is untested.
+Expect to re-map controls once — the DirectInput instance changes with the route.
 
-- `revert-rawhid.sh` rebinds through sysfs, which emits `bind` — the udev rule
-  only matches `add|change` (above), so the new node can come up root-owned and
-  a game cannot open it. **Replug the base or reboot after reverting**, then
-  check the mode with `ls -l` on the hidraw node.
-- The Wine prefix caches the device as it first enumerated it, PID-less. Clear
-  it with `protontricks -c "wine reg delete 'HKLM\System\CurrentControlSet\Enum\HID' /f" <appid>`.
+Rim and base LEDs stay dark on that route, and that is not a separate fault:
+ACC drives them through the Fanatec SDK, which needs the HIDRAW device, and the
+clone carries nothing to drive. With 0.2.3 on this base, LEDs and force feedback
+cannot both work.
 
-`PROTON_LOG=1 WINEDEBUG=+hid,+input,+dinput %command%` as a launch option
-settles which path a game actually took: the log names `found 3 TLCs` when
-Proton has picked up the PID-extended descriptor.
+The consequence for this repo: because no game should be on the HIDRAW route,
+**diagnostic mode is free**. `enable-rawhid.sh` and in-game force feedback are
+not in tension, and the earlier reading that they were was wrong.
+
+`PROTON_LOG=1 WINEDEBUG=+hid,+input,+dinput %command%` settles which route a run
+took. The lines that matter, from the run that established all of the above:
+
+    creating hidraw device 0eb7:0e03 with usages 0001:0004     HIDRAW route taken
+    hid_joystick_create_device set constant force id 0, coll 0  every PID id zero
+    sdl_add_device ... 0eb7:0e03 ... is_hidraw 0                SDL device present
+    HidP_GetCollectionDescription report_desc_len 1334          and PID-capable
+
+Wine parsed a 1334-byte descriptor full of usage-page `0x0F` items — that is
+Wine's *synthesised* one for the SDL device, not the base's. The base and its
+clone are 133 bytes with no `0x0F` anywhere.
 
 ## Steering — healthy
 
