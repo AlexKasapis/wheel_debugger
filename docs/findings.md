@@ -87,18 +87,24 @@ descriptor clone with nothing behind it. Taking the libinput/SDL route to get
 force feedback puts the game further still from the SDK. **No launch option
 makes ACC light these LEDs on 0.2.3.** It is not a wiring fault and not the rim.
 
-The driver's own LED-class interface is a separate path and it is present and
-reachable:
+The driver's own LED-class interface is a separate path, and unlike the HIDRAW
+one it **works — measured, not inferred**:
 
     .../0003:0EB7:0E03.<n>/leds/0003:0EB7:0E03.<n>::RPM1..RPM9/brightness
-    -rw-rw---- root games        all reading 0
+    -rw-rw---- root games   max_brightness 1
 
-`games`-writable, so a userspace process can light them without root — see the
-udev caveat in [driver.md](driver.md) about a sysfs rebind leaving these
-root-owned until a replug. Driving them *from telemetry* is what upstream's
-companion project `hid-fanatecff-tools` exists for: it reads the game's shared
-memory and writes these files. That is the only route to working rim LEDs here,
-and it is outside this repo.
+Writing 1 to each in turn lit each LED on the rim and writing 0 cleared it; nine
+for nine, no write errors, as the user at the rig. So the LEDs, the rim wiring
+and the driver's LED path are all good, and this is one place the base's
+unnumbered reports do *not* bite — worth knowing, because `wheel_id`,
+`fw_version` and the PID injection all fail that way.
+
+`games`-writable means no root is needed — see the udev caveat in
+[driver.md](driver.md) about a sysfs rebind leaving these root-owned until a
+replug. Driving them *from telemetry* is what upstream's companion project
+`hid-fanatecff-tools` exists for: it reads the game's shared memory and writes
+these files. That is the route to working rim LEDs here, and it is outside this
+repo.
 
 ## Steering — healthy
 
